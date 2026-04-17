@@ -1,0 +1,1 @@
+{"version":3,"file":"connectorText.js","sourceRoot":"","sources":["../../../../../engines/openclaude/src/types/connectorText.ts"],"names":[],"mappings":"AAYA,MAAM,UAAU,oBAAoB,CAClC,KAAc;IAEd,OAAO,CACL,OAAO,KAAK,KAAK,QAAQ;QACzB,KAAK,KAAK,IAAI;QACd,gBAAgB,IAAI,KAAK;QACzB,OAAQ,KAAsC,CAAC,cAAc,KAAK,QAAQ,CAC3E,CAAA;AACH,CAAC"}

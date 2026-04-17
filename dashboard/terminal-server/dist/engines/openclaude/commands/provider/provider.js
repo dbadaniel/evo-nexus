@@ -1,0 +1,902 @@
+import * as React from 'react';
+import { COMMON_HELP_ARGS, COMMON_INFO_ARGS } from '../../constants/xml.js';
+import { ProviderManager } from '../../components/ProviderManager.js';
+import TextInput from '../../components/TextInput.js';
+import { Select, } from '../../components/CustomSelect/index.js';
+import { Dialog } from '../../components/design-system/Dialog.js';
+import { LoadingState } from '../../components/design-system/LoadingState.js';
+import { useCodexOAuthFlow } from '../../components/useCodexOAuthFlow.js';
+import { useTerminalSize } from '../../hooks/useTerminalSize.js';
+import { Box, Text } from '../../ink.js';
+import { DEFAULT_CODEX_BASE_URL, DEFAULT_OPENAI_BASE_URL, isLocalProviderUrl, resolveCodexApiCredentials, resolveProviderRequest, } from '../../services/api/providerConfig.js';
+import { applySavedProfileToCurrentSession as applySharedProfileToCurrentSession, buildCodexOAuthProfileEnv as buildSharedCodexOAuthProfileEnv, buildCodexProfileEnv, buildGeminiProfileEnv, buildMistralProfileEnv, buildOllamaProfileEnv, buildOpenAIProfileEnv, createProfileFile, DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_MODEL, DEFAULT_MISTRAL_BASE_URL, DEFAULT_MISTRAL_MODEL, deleteProfileFile, loadProfileFile, maskSecretForDisplay, redactSecretValueForDisplay, sanitizeApiKey, sanitizeProviderConfigValue, saveProfileFile, } from '../../utils/providerProfile.js';
+import { getGeminiProjectIdHint, mayHaveGeminiAdcCredentials, } from '../../utils/geminiAuth.js';
+import { readGeminiAccessToken, saveGeminiAccessToken, } from '../../utils/geminiCredentials.js';
+import { isBareMode } from '../../utils/envUtils.js';
+import { getGoalDefaultOpenAIModel, normalizeRecommendationGoal, rankOllamaModels, recommendOllamaModel, } from '../../utils/providerRecommendation.js';
+import { getOllamaChatBaseUrl, getLocalOpenAICompatibleProviderLabel, hasLocalOllama, listOllamaModels, } from '../../utils/providerDiscovery.js';
+function isEnvTruthy(value) {
+    if (!value)
+        return false;
+    const normalized = value.trim().toLowerCase();
+    return normalized !== '' && normalized !== '0' && normalized !== 'false' && normalized !== 'no';
+}
+function getSafeDisplayValue(value, processEnv, profileEnv, fallback = '(not set)') {
+    return (redactSecretValueForDisplay(value, processEnv, profileEnv) ?? fallback);
+}
+export function getProviderWizardDefaults(processEnv = process.env) {
+    const secretSource = processEnv;
+    const safeOpenAIModel = sanitizeProviderConfigValue(processEnv.OPENAI_MODEL, secretSource) ||
+        'gpt-4o';
+    const safeOpenAIBaseUrl = sanitizeProviderConfigValue(processEnv.OPENAI_BASE_URL, secretSource) ||
+        DEFAULT_OPENAI_BASE_URL;
+    const safeGeminiModel = sanitizeProviderConfigValue(processEnv.GEMINI_MODEL, secretSource) ||
+        DEFAULT_GEMINI_MODEL;
+    const safeMistralModel = sanitizeProviderConfigValue(processEnv.MISTRAL_MODEL, processEnv) ||
+        DEFAULT_MISTRAL_MODEL;
+    const safeMistralBaseUrl = sanitizeProviderConfigValue(processEnv.MISTRAL_BASE_URL, processEnv) ||
+        DEFAULT_MISTRAL_BASE_URL;
+    return {
+        openAIModel: safeOpenAIModel,
+        openAIBaseUrl: safeOpenAIBaseUrl,
+        geminiModel: safeGeminiModel,
+        mistralModel: safeMistralModel,
+        mistralBaseUrl: safeMistralBaseUrl,
+    };
+}
+export function buildCurrentProviderSummary(options) {
+    const processEnv = options?.processEnv ?? process.env;
+    const secretSource = processEnv;
+    const persisted = options?.persisted ?? loadProfileFile();
+    const savedProfileLabel = persisted?.profile ?? 'none';
+    if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_GEMINI)) {
+        return {
+            providerLabel: 'Google Gemini',
+            modelLabel: getSafeDisplayValue(processEnv.GEMINI_MODEL ?? DEFAULT_GEMINI_MODEL, secretSource),
+            endpointLabel: getSafeDisplayValue(processEnv.GEMINI_BASE_URL ?? DEFAULT_GEMINI_BASE_URL, secretSource),
+            savedProfileLabel,
+        };
+    }
+    if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_MISTRAL)) {
+        return {
+            providerLabel: 'Mistral',
+            modelLabel: getSafeDisplayValue(processEnv.MISTRAL_MODEL ?? DEFAULT_MISTRAL_MODEL, processEnv),
+            endpointLabel: getSafeDisplayValue(processEnv.MISTRAL_BASE_URL ?? DEFAULT_MISTRAL_BASE_URL, processEnv),
+            savedProfileLabel,
+        };
+    }
+    if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_GITHUB)) {
+        return {
+            providerLabel: 'GitHub Models',
+            modelLabel: getSafeDisplayValue(processEnv.OPENAI_MODEL ?? 'github:copilot', secretSource),
+            endpointLabel: getSafeDisplayValue(processEnv.OPENAI_BASE_URL ??
+                processEnv.OPENAI_API_BASE ??
+                'https://models.github.ai/inference', secretSource),
+            savedProfileLabel,
+        };
+    }
+    if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_OPENAI)) {
+        const request = resolveProviderRequest({
+            model: processEnv.OPENAI_MODEL,
+            baseUrl: processEnv.OPENAI_BASE_URL,
+        });
+        let providerLabel = 'OpenAI-compatible';
+        if (request.transport === 'codex_responses') {
+            providerLabel = 'Codex';
+        }
+        else if (isLocalProviderUrl(request.baseUrl)) {
+            providerLabel = getLocalOpenAICompatibleProviderLabel(request.baseUrl);
+        }
+        return {
+            providerLabel,
+            modelLabel: getSafeDisplayValue(request.requestedModel, secretSource),
+            endpointLabel: getSafeDisplayValue(request.baseUrl, secretSource),
+            savedProfileLabel,
+        };
+    }
+    return {
+        providerLabel: 'Anthropic',
+        modelLabel: getSafeDisplayValue(processEnv.ANTHROPIC_MODEL ??
+            processEnv.CLAUDE_MODEL ??
+            'claude-sonnet-4-6', secretSource),
+        endpointLabel: getSafeDisplayValue(processEnv.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com', secretSource),
+        savedProfileLabel,
+    };
+}
+function buildSavedProfileSummary(profile, env) {
+    switch (profile) {
+        case 'gemini':
+            return {
+                providerLabel: 'Google Gemini',
+                modelLabel: getSafeDisplayValue(env.GEMINI_MODEL ?? DEFAULT_GEMINI_MODEL, process.env, env),
+                endpointLabel: getSafeDisplayValue(env.GEMINI_BASE_URL ?? DEFAULT_GEMINI_BASE_URL, process.env, env),
+                credentialLabel: env.GEMINI_AUTH_MODE === 'access-token'
+                    ? 'access token (stored securely)'
+                    : env.GEMINI_AUTH_MODE === 'adc'
+                        ? 'local ADC'
+                        : maskSecretForDisplay(env.GEMINI_API_KEY) !== undefined
+                            ? 'configured'
+                            : undefined,
+            };
+        case 'mistral':
+            return {
+                providerLabel: 'Mistral',
+                modelLabel: getSafeDisplayValue(env.MISTRAL_MODEL ?? DEFAULT_MISTRAL_MODEL, process.env, env),
+                endpointLabel: getSafeDisplayValue(env.MISTRAL_BASE_URL ?? DEFAULT_MISTRAL_BASE_URL, process.env, env),
+                credentialLabel: maskSecretForDisplay(env.MISTRAL_API_KEY) !== undefined
+                    ? 'configured'
+                    : undefined,
+            };
+        case 'codex':
+            return {
+                providerLabel: 'Codex',
+                modelLabel: getSafeDisplayValue(env.OPENAI_MODEL ?? 'codexplan', process.env, env),
+                endpointLabel: getSafeDisplayValue(env.OPENAI_BASE_URL ?? DEFAULT_CODEX_BASE_URL, process.env, env),
+                credentialLabel: maskSecretForDisplay(env.CODEX_API_KEY) !== undefined
+                    ? 'configured'
+                    : undefined,
+            };
+        case 'ollama':
+            return {
+                providerLabel: 'Ollama',
+                modelLabel: getSafeDisplayValue(env.OPENAI_MODEL, process.env, env),
+                endpointLabel: getSafeDisplayValue(env.OPENAI_BASE_URL, process.env, env),
+            };
+        case 'openai':
+        default: {
+            const baseUrl = env.OPENAI_BASE_URL ?? DEFAULT_OPENAI_BASE_URL;
+            return {
+                providerLabel: isLocalProviderUrl(baseUrl)
+                    ? getLocalOpenAICompatibleProviderLabel(baseUrl)
+                    : 'OpenAI-compatible',
+                modelLabel: getSafeDisplayValue(env.OPENAI_MODEL ?? 'gpt-4o', process.env, env),
+                endpointLabel: getSafeDisplayValue(baseUrl, process.env, env),
+                credentialLabel: maskSecretForDisplay(env.OPENAI_API_KEY) !== undefined
+                    ? 'configured'
+                    : undefined,
+            };
+        }
+    }
+}
+export function buildProfileSaveMessage(profile, env, filePath, options) {
+    const summary = buildSavedProfileSummary(profile, env);
+    const lines = [
+        `Saved ${summary.providerLabel} profile.`,
+        `Model: ${summary.modelLabel}`,
+        `Endpoint: ${summary.endpointLabel}`,
+    ];
+    if (summary.credentialLabel) {
+        lines.push(`Credentials: ${summary.credentialLabel}`);
+    }
+    lines.push(`Profile: ${filePath}`);
+    if (options?.activatedInSession) {
+        lines.push('OpenClaude switched to it for this session.');
+    }
+    else if (options?.activationWarning) {
+        lines.push(`Saved for next startup. Warning: could not activate it in this session (${options.activationWarning}).`);
+    }
+    else {
+        lines.push('Restart OpenClaude to use it.');
+    }
+    return lines.join('\n');
+}
+function buildUsageText() {
+    const summary = buildCurrentProviderSummary();
+    const availableProviders = isBareMode()
+        ? 'Choose Auto, Ollama, OpenAI-compatible, Gemini, or Codex, then save a provider profile.'
+        : 'Choose Auto, Ollama, OpenAI-compatible, Gemini, Codex, or Codex OAuth, then save a provider profile.';
+    return [
+        'Usage: /provider',
+        '',
+        'Guided setup for saved provider profiles.',
+        '',
+        `Current provider: ${summary.providerLabel}`,
+        `Current model: ${summary.modelLabel}`,
+        `Current endpoint: ${summary.endpointLabel}`,
+        `Saved profile: ${summary.savedProfileLabel}`,
+        '',
+        availableProviders,
+    ].join('\n');
+}
+function finishProfileSave(onDone, profile, env) {
+    void saveProfileAndNotify(onDone, profile, env);
+}
+export function buildCodexOAuthProfileEnv(tokens) {
+    return buildSharedCodexOAuthProfileEnv(tokens);
+}
+export async function applySavedProfileToCurrentSession(options) {
+    return applySharedProfileToCurrentSession(options);
+}
+async function saveProfileAndNotify(onDone, profile, env) {
+    try {
+        const profileFile = createProfileFile(profile, env);
+        const filePath = saveProfileFile(profileFile);
+        const shouldActivateInSession = profile === 'codex';
+        const activationWarning = shouldActivateInSession
+            ? await applySharedProfileToCurrentSession({ profileFile })
+            : null;
+        onDone(buildProfileSaveMessage(profile, env, filePath, {
+            activatedInSession: shouldActivateInSession && activationWarning === null,
+            activationWarning,
+        }), {
+            display: 'system',
+        });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        onDone(`Failed to save provider profile: ${message}`, {
+            display: 'system',
+        });
+    }
+}
+export function TextEntryDialog({ title, subtitle, resetStateKey, description, initialValue, placeholder, mask, allowEmpty = false, validate, onSubmit, onCancel, }) {
+    const { columns } = useTerminalSize();
+    const [value, setValue] = React.useState(initialValue);
+    const [cursorOffset, setCursorOffset] = React.useState(initialValue.length);
+    const [error, setError] = React.useState(null);
+    React.useLayoutEffect(() => {
+        setValue(initialValue);
+        setCursorOffset(initialValue.length);
+        setError(null);
+    }, [initialValue, resetStateKey]);
+    const inputColumns = Math.max(30, columns - 6);
+    const handleSubmit = React.useCallback((nextValue) => {
+        if (!allowEmpty && nextValue.trim().length === 0) {
+            setError('A value is required for this step.');
+            return;
+        }
+        const validationError = validate?.(nextValue);
+        if (validationError) {
+            setError(validationError);
+            return;
+        }
+        setError(null);
+        onSubmit(nextValue);
+    }, [allowEmpty, onSubmit, validate]);
+    return (React.createElement(Dialog, { title: title, subtitle: subtitle, onCancel: onCancel },
+        React.createElement(Box, { flexDirection: "column", gap: 1 },
+            React.createElement(Text, null, description),
+            React.createElement(TextInput, { value: value, onChange: setValue, onSubmit: handleSubmit, placeholder: placeholder, mask: mask, columns: inputColumns, cursorOffset: cursorOffset, onChangeCursorOffset: setCursorOffset, focus: true, showCursor: true }),
+            error ? React.createElement(Text, { color: "error" }, error) : null)));
+}
+function ProviderChooser({ onChoose, onCancel, }) {
+    const summary = buildCurrentProviderSummary();
+    const canUseCodexOAuth = !isBareMode();
+    const helperText = canUseCodexOAuth
+        ? 'Save a provider profile without editing environment variables first. Codex profiles backed by env, auth.json, or OpenClaude secure storage can switch this session immediately when validation succeeds.'
+        : 'Save a provider profile without editing environment variables first. Codex profiles backed by env or auth.json can switch this session immediately.';
+    const options = [
+        {
+            label: 'Auto',
+            value: 'auto',
+            description: 'Prefer local Ollama when available, otherwise guide you into OpenAI-compatible setup',
+        },
+        {
+            label: 'Ollama',
+            value: 'ollama',
+            description: 'Use a local Ollama model with no API key',
+        },
+        {
+            label: 'OpenAI-compatible',
+            value: 'openai',
+            description: 'GPT-4o, DeepSeek, OpenRouter, Groq, LM Studio, and similar APIs',
+        },
+        {
+            label: 'Gemini',
+            value: 'gemini',
+            description: 'Use Google Gemini with API key, access token, or local ADC',
+        },
+        {
+            label: 'Mistral',
+            value: 'mistral',
+            description: 'Use Mistral with API key'
+        },
+        {
+            label: 'Codex',
+            value: 'codex',
+            description: 'Use existing ChatGPT Codex CLI auth or env credentials',
+        },
+        ...(canUseCodexOAuth
+            ? [
+                {
+                    label: 'Codex OAuth',
+                    value: 'codex-oauth',
+                    description: 'Sign in with ChatGPT in your browser and store Codex tokens securely',
+                },
+            ]
+            : []),
+    ];
+    if (summary.savedProfileLabel !== 'none') {
+        options.push({
+            label: 'Clear saved profile',
+            value: 'clear',
+            description: 'Remove .openclaude-profile.json and return to normal startup',
+        });
+    }
+    return (React.createElement(Dialog, { title: "Set up a provider profile", subtitle: `Current provider: ${summary.providerLabel}`, onCancel: onCancel },
+        React.createElement(Box, { flexDirection: "column", gap: 1 },
+            React.createElement(Text, null, helperText),
+            React.createElement(Box, { flexDirection: "column" },
+                React.createElement(Text, { dimColor: true },
+                    "Current model: ",
+                    summary.modelLabel),
+                React.createElement(Text, { dimColor: true },
+                    "Current endpoint: ",
+                    summary.endpointLabel),
+                React.createElement(Text, { dimColor: true },
+                    "Saved profile: ",
+                    summary.savedProfileLabel)),
+            React.createElement(Select, { options: options, inlineDescriptions: true, visibleOptionCount: options.length, onChange: onChoose, onCancel: onCancel }))));
+}
+function AutoGoalChooser({ onChoose, onBack, }) {
+    const options = [
+        {
+            label: 'Balanced',
+            value: 'balanced',
+            description: 'Strong everyday default for most users',
+        },
+        {
+            label: 'Coding',
+            value: 'coding',
+            description: 'Prefer coding-oriented local models or GPT-4o defaults',
+        },
+        {
+            label: 'Latency',
+            value: 'latency',
+            description: 'Prefer faster local models or gpt-4o-mini defaults',
+        },
+    ];
+    return (React.createElement(Dialog, { title: "Auto setup goal", onCancel: onBack },
+        React.createElement(Box, { flexDirection: "column", gap: 1 },
+            React.createElement(Text, null, "Pick the goal Auto setup should optimize for."),
+            React.createElement(Select, { options: options, defaultValue: "balanced", defaultFocusValue: "balanced", inlineDescriptions: true, visibleOptionCount: options.length, onChange: onChoose, onCancel: onBack }))));
+}
+function AutoRecommendationStep({ goal, onBack, onSave, onNeedOpenAI, onCancel, }) {
+    const [status, setStatus] = React.useState({ state: 'loading' });
+    React.useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            const defaultModel = getGoalDefaultOpenAIModel(goal);
+            try {
+                const ollamaAvailable = await hasLocalOllama();
+                if (!ollamaAvailable) {
+                    if (!cancelled) {
+                        setStatus({ state: 'openai', defaultModel });
+                    }
+                    return;
+                }
+                const models = await listOllamaModels();
+                const recommended = recommendOllamaModel(models, goal);
+                if (!recommended) {
+                    if (!cancelled) {
+                        setStatus({ state: 'openai', defaultModel });
+                    }
+                    return;
+                }
+                if (!cancelled) {
+                    setStatus({
+                        state: 'ollama',
+                        model: recommended.name,
+                        summary: recommended.summary,
+                    });
+                }
+            }
+            catch (error) {
+                if (!cancelled) {
+                    setStatus({
+                        state: 'error',
+                        message: error instanceof Error ? error.message : String(error),
+                    });
+                }
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [goal]);
+    if (status.state === 'loading') {
+        return React.createElement(LoadingState, { message: "Checking local providers\u2026" });
+    }
+    if (status.state === 'error') {
+        return (React.createElement(Dialog, { title: "Auto setup failed", onCancel: onCancel, color: "warning" },
+            React.createElement(Box, { flexDirection: "column", gap: 1 },
+                React.createElement(Text, null, status.message),
+                React.createElement(Select, { options: [
+                        { label: 'Back', value: 'back' },
+                        { label: 'Cancel', value: 'cancel' },
+                    ], onChange: (value) => value === 'back' ? onBack() : onCancel(), onCancel: onCancel }))));
+    }
+    if (status.state === 'openai') {
+        return (React.createElement(Dialog, { title: "Auto setup fallback", onCancel: onCancel },
+            React.createElement(Box, { flexDirection: "column", gap: 1 },
+                React.createElement(Text, null,
+                    "No viable local Ollama chat model was detected. Auto setup can continue into OpenAI-compatible setup with a default model of",
+                    ' ',
+                    status.defaultModel,
+                    "."),
+                React.createElement(Select, { options: [
+                        { label: 'Continue to OpenAI-compatible setup', value: 'continue' },
+                        { label: 'Back', value: 'back' },
+                        { label: 'Cancel', value: 'cancel' },
+                    ], onChange: (value) => {
+                        if (value === 'continue') {
+                            onNeedOpenAI(status.defaultModel);
+                        }
+                        else if (value === 'back') {
+                            onBack();
+                        }
+                        else {
+                            onCancel();
+                        }
+                    }, onCancel: onCancel }))));
+    }
+    return (React.createElement(Dialog, { title: "Save recommended profile?", onCancel: onBack },
+        React.createElement(Box, { flexDirection: "column", gap: 1 },
+            React.createElement(Text, null,
+                "Auto setup recommends a local Ollama profile for ",
+                goal,
+                " based on the models currently available on this machine."),
+            React.createElement(Text, { dimColor: true },
+                "Recommended model: ",
+                status.model,
+                status.summary ? ` · ${status.summary}` : ''),
+            React.createElement(Select, { options: [
+                    { label: 'Save recommended Ollama profile', value: 'save' },
+                    { label: 'Back', value: 'back' },
+                    { label: 'Cancel', value: 'cancel' },
+                ], onChange: (value) => {
+                    if (value === 'save') {
+                        onSave('ollama', buildOllamaProfileEnv(status.model, {
+                            getOllamaChatBaseUrl,
+                        }));
+                    }
+                    else if (value === 'back') {
+                        onBack();
+                    }
+                    else {
+                        onCancel();
+                    }
+                }, onCancel: onBack }))));
+}
+function OllamaModelStep({ onSave, onBack, onCancel, }) {
+    const [status, setStatus] = React.useState({ state: 'loading' });
+    React.useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            const available = await hasLocalOllama();
+            if (!available) {
+                if (!cancelled) {
+                    setStatus({
+                        state: 'unavailable',
+                        message: 'Could not reach Ollama at http://localhost:11434. Start Ollama first, then run /provider again.',
+                    });
+                }
+                return;
+            }
+            const models = await listOllamaModels();
+            if (models.length === 0) {
+                if (!cancelled) {
+                    setStatus({
+                        state: 'unavailable',
+                        message: 'Ollama is running, but no installed models were found. Pull a chat model such as qwen2.5-coder:7b or llama3.1:8b first.',
+                    });
+                }
+                return;
+            }
+            const ranked = rankOllamaModels(models, 'balanced');
+            const recommended = recommendOllamaModel(models, 'balanced');
+            if (!cancelled) {
+                setStatus({
+                    state: 'ready',
+                    defaultValue: recommended?.name ?? ranked[0]?.name,
+                    options: ranked.map(model => ({
+                        label: model.name,
+                        value: model.name,
+                        description: model.summary,
+                    })),
+                });
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+    if (status.state === 'loading') {
+        return React.createElement(LoadingState, { message: "Checking local Ollama models\u2026" });
+    }
+    if (status.state === 'unavailable') {
+        return (React.createElement(Dialog, { title: "Ollama setup", onCancel: onCancel, color: "warning" },
+            React.createElement(Box, { flexDirection: "column", gap: 1 },
+                React.createElement(Text, null, status.message),
+                React.createElement(Select, { options: [
+                        { label: 'Back', value: 'back' },
+                        { label: 'Cancel', value: 'cancel' },
+                    ], onChange: (value) => value === 'back' ? onBack() : onCancel(), onCancel: onCancel }))));
+    }
+    return (React.createElement(Dialog, { title: "Choose an Ollama model", onCancel: onBack },
+        React.createElement(Box, { flexDirection: "column", gap: 1 },
+            React.createElement(Text, null, "Pick one of the installed Ollama models to save into a local provider profile."),
+            React.createElement(Select, { options: status.options, defaultValue: status.defaultValue, defaultFocusValue: status.defaultValue, inlineDescriptions: true, visibleOptionCount: Math.min(8, status.options.length), onChange: (value) => {
+                    onSave('ollama', buildOllamaProfileEnv(value, {
+                        getOllamaChatBaseUrl,
+                    }));
+                }, onCancel: onBack }))));
+}
+function CodexOAuthStep({ onSave, onBack, onCancel, }) {
+    const handleAuthenticated = React.useCallback(async (tokens, persistCredentials) => {
+        const env = buildCodexOAuthProfileEnv(tokens);
+        if (!env) {
+            throw new Error('Codex OAuth succeeded, but OpenClaude could not build a Codex profile from the stored credentials.');
+        }
+        persistCredentials();
+        onSave('codex', env);
+    }, [onSave]);
+    const status = useCodexOAuthFlow({
+        onAuthenticated: handleAuthenticated,
+    });
+    if (status.state === 'error') {
+        return (React.createElement(Dialog, { title: "Codex OAuth failed", onCancel: onCancel, color: "warning" },
+            React.createElement(Box, { flexDirection: "column", gap: 1 },
+                React.createElement(Text, null, status.message),
+                React.createElement(Select, { options: [
+                        { label: 'Back', value: 'back' },
+                        { label: 'Cancel', value: 'cancel' },
+                    ], onChange: (value) => value === 'back' ? onBack() : onCancel(), onCancel: onCancel }))));
+    }
+    if (status.state === 'starting') {
+        return React.createElement(LoadingState, { message: "Starting Codex OAuth..." });
+    }
+    return (React.createElement(Dialog, { title: "Codex OAuth", onCancel: onBack },
+        React.createElement(Box, { flexDirection: "column", gap: 1 },
+            React.createElement(Text, null, "Finish signing in with ChatGPT in your browser. OpenClaude will store the resulting Codex credentials securely for future sessions."),
+            status.browserOpened === false ? (React.createElement(Text, { color: "warning" }, "Browser did not open automatically. Visit this URL to continue:")) : status.browserOpened === true ? (React.createElement(Text, { dimColor: true }, "Browser opened. Complete the sign-in there, then OpenClaude will finish setup automatically.")) : (React.createElement(Text, { dimColor: true }, "Opening your browser...")),
+            React.createElement(Text, null, status.authUrl),
+            React.createElement(Text, { dimColor: true }, "Press Esc to cancel and go back."))));
+}
+function CodexCredentialStep({ onSave, onBack, onCancel, }) {
+    const credentials = resolveCodexCredentials(process.env);
+    if (!credentials.ok) {
+        return (React.createElement(Dialog, { title: "Codex setup", onCancel: onCancel, color: "warning" },
+            React.createElement(Box, { flexDirection: "column", gap: 1 },
+                React.createElement(Text, null, credentials.message),
+                React.createElement(Select, { options: [
+                        { label: 'Back', value: 'back' },
+                        { label: 'Cancel', value: 'cancel' },
+                    ], onChange: (value) => value === 'back' ? onBack() : onCancel(), onCancel: onCancel }))));
+    }
+    const options = [
+        {
+            label: 'codexplan',
+            value: 'codexplan',
+            description: 'GPT-5.4 with higher reasoning on the Codex backend',
+        },
+        {
+            label: 'codexspark',
+            value: 'codexspark',
+            description: 'Faster Codex Spark tool loop profile',
+        },
+    ];
+    return (React.createElement(Dialog, { title: "Choose a Codex profile", onCancel: onBack },
+        React.createElement(Box, { flexDirection: "column", gap: 1 },
+            React.createElement(Text, null,
+                "Reuse your existing Codex credentials from",
+                ' ',
+                credentials.sourceDescription,
+                " and save a model alias profile."),
+            React.createElement(Select, { options: options, defaultValue: "codexplan", defaultFocusValue: "codexplan", inlineDescriptions: true, visibleOptionCount: options.length, onChange: (value) => {
+                    const env = buildCodexProfileEnv({
+                        model: value,
+                        credentialSource: credentials.credentialSource,
+                        processEnv: process.env,
+                    });
+                    if (env) {
+                        onSave('codex', env);
+                    }
+                }, onCancel: onBack }))));
+}
+function resolveCodexCredentials(processEnv) {
+    const credentials = resolveCodexApiCredentials(processEnv);
+    const oauthHint = isBareMode()
+        ? 'Re-login with the Codex CLI'
+        : 'Choose Codex OAuth in /provider, or re-login with the Codex CLI';
+    if (!credentials.apiKey) {
+        const authHint = credentials.authPath
+            ? `Expected auth file: ${credentials.authPath}.`
+            : 'Set CODEX_API_KEY or re-login with the Codex CLI.';
+        return {
+            ok: false,
+            message: `Codex setup needs existing credentials. ${oauthHint}, or set CODEX_API_KEY. ${authHint}`,
+        };
+    }
+    if (!credentials.accountId) {
+        return {
+            ok: false,
+            message: `Codex auth is missing chatgpt_account_id. ${oauthHint}, or set CHATGPT_ACCOUNT_ID/CODEX_ACCOUNT_ID first.`,
+        };
+    }
+    return {
+        ok: true,
+        credentialSource: credentials.source === 'secure-storage' ? 'oauth' : 'existing',
+        sourceDescription: credentials.source === 'env'
+            ? 'the current shell environment'
+            : credentials.source === 'secure-storage'
+                ? 'OpenClaude secure storage'
+                : credentials.authPath ?? DEFAULT_CODEX_BASE_URL,
+    };
+}
+export function ProviderWizard({ onDone, }) {
+    const defaults = getProviderWizardDefaults();
+    const [step, setStep] = React.useState({ name: 'choose' });
+    switch (step.name) {
+        case 'choose':
+            return (React.createElement(ProviderChooser, { onChoose: value => {
+                    if (value === 'auto') {
+                        setStep({ name: 'auto-goal' });
+                    }
+                    else if (value === 'ollama') {
+                        setStep({ name: 'ollama-detect' });
+                    }
+                    else if (value === 'openai') {
+                        setStep({
+                            name: 'openai-key',
+                            defaultModel: defaults.openAIModel,
+                        });
+                    }
+                    else if (value === 'gemini') {
+                        setStep({ name: 'gemini-auth-method' });
+                    }
+                    else if (value === 'mistral') {
+                        setStep({
+                            name: 'mistral-key',
+                            defaultModel: defaults.mistralModel,
+                        });
+                    }
+                    else if (value === 'codex-oauth') {
+                        setStep({ name: 'codex-oauth' });
+                    }
+                    else if (value === 'clear') {
+                        const filePath = deleteProfileFile();
+                        onDone(`Removed saved provider profile at ${filePath}. Restart OpenClaude to go back to normal startup.`, {
+                            display: 'system',
+                        });
+                    }
+                    else {
+                        setStep({ name: 'codex-check' });
+                    }
+                }, onCancel: () => onDone() }));
+        case 'auto-goal':
+            return (React.createElement(AutoGoalChooser, { onChoose: goal => setStep({ name: 'auto-detect', goal }), onBack: () => setStep({ name: 'choose' }) }));
+        case 'auto-detect':
+            return (React.createElement(AutoRecommendationStep, { goal: step.goal, onBack: () => setStep({ name: 'auto-goal' }), onSave: (profile, env) => finishProfileSave(onDone, profile, env), onNeedOpenAI: defaultModel => setStep({ name: 'openai-key', defaultModel }), onCancel: () => onDone() }));
+        case 'ollama-detect':
+            return (React.createElement(OllamaModelStep, { onSave: (profile, env) => finishProfileSave(onDone, profile, env), onBack: () => setStep({ name: 'choose' }), onCancel: () => onDone() }));
+        case 'openai-key':
+            return (React.createElement(TextEntryDialog, { resetStateKey: step.name, title: "OpenAI-compatible setup", subtitle: "Step 1 of 3", description: process.env.OPENAI_API_KEY
+                    ? 'Enter an API key, or leave this blank to reuse the current OPENAI_API_KEY from this session.'
+                    : 'Enter the API key for your OpenAI-compatible provider.', initialValue: "", placeholder: "sk-...", mask: "*", allowEmpty: Boolean(process.env.OPENAI_API_KEY), validate: value => {
+                    const candidate = value.trim() || process.env.OPENAI_API_KEY || '';
+                    return sanitizeApiKey(candidate)
+                        ? null
+                        : 'Enter a real API key. Placeholder values like SUA_CHAVE are not valid.';
+                }, onSubmit: value => {
+                    const apiKey = value.trim() || process.env.OPENAI_API_KEY || '';
+                    setStep({
+                        name: 'openai-base',
+                        apiKey,
+                        defaultModel: step.defaultModel,
+                    });
+                }, onCancel: () => setStep({ name: 'choose' }) }));
+        case 'openai-base':
+            return (React.createElement(TextEntryDialog, { resetStateKey: step.name, title: "OpenAI-compatible setup", subtitle: "Step 2 of 3", description: `Optionally enter a base URL. Leave blank for ${DEFAULT_OPENAI_BASE_URL}.`, initialValue: defaults.openAIBaseUrl === DEFAULT_OPENAI_BASE_URL
+                    ? ''
+                    : defaults.openAIBaseUrl, placeholder: DEFAULT_OPENAI_BASE_URL, allowEmpty: true, onSubmit: value => {
+                    setStep({
+                        name: 'openai-model',
+                        apiKey: step.apiKey,
+                        baseUrl: value.trim() || null,
+                        defaultModel: step.defaultModel,
+                    });
+                }, onCancel: () => setStep({
+                    name: 'openai-key',
+                    defaultModel: step.defaultModel,
+                }) }));
+        case 'openai-model':
+            return (React.createElement(TextEntryDialog, { resetStateKey: step.name, title: "OpenAI-compatible setup", subtitle: "Step 3 of 3", description: `Enter a model name. Leave blank for ${step.defaultModel}.`, initialValue: defaults.openAIModel ?? step.defaultModel, placeholder: step.defaultModel, allowEmpty: true, onSubmit: value => {
+                    const env = buildOpenAIProfileEnv({
+                        goal: normalizeRecommendationGoal(null),
+                        apiKey: step.apiKey,
+                        baseUrl: step.baseUrl,
+                        model: value.trim() || step.defaultModel,
+                        processEnv: {},
+                    });
+                    if (env) {
+                        finishProfileSave(onDone, 'openai', env);
+                    }
+                }, onCancel: () => setStep({
+                    name: 'openai-base',
+                    apiKey: step.apiKey,
+                    defaultModel: step.defaultModel,
+                }) }));
+        case 'mistral-key':
+            return (React.createElement(TextEntryDialog, { resetStateKey: step.name, title: "Mistral setup", subtitle: "Step 1 of 3", description: process.env.MISTRAL_API_KEY
+                    ? 'Enter an API key, or leave this blank to reuse the current MISTRAL_API_KEY from this session.'
+                    : 'Enter the API key for your Mistral provider.', initialValue: "", placeholder: "...", mask: "*", allowEmpty: Boolean(process.env.MISTRAL_API_KEY), validate: value => {
+                    const candidate = value.trim() || process.env.MISTRAL_API_KEY || '';
+                    return sanitizeApiKey(candidate)
+                        ? null
+                        : 'Enter a real API key. Placeholder values like SUA_CHAVE are not valid.';
+                }, onSubmit: value => {
+                    const apiKey = value.trim() || process.env.MISTRAL_API_KEY || '';
+                    setStep({
+                        name: 'mistral-base',
+                        apiKey,
+                        defaultModel: step.defaultModel,
+                    });
+                }, onCancel: () => setStep({ name: 'choose' }) }));
+        case 'mistral-base':
+            return (React.createElement(TextEntryDialog, { resetStateKey: step.name, title: "Mistral setup", subtitle: "Step 2 of 3", description: `Optionally enter a base URL. Leave blank for ${DEFAULT_MISTRAL_BASE_URL}.`, initialValue: defaults.mistralBaseUrl === DEFAULT_MISTRAL_BASE_URL
+                    ? ''
+                    : defaults.mistralBaseUrl, placeholder: DEFAULT_MISTRAL_BASE_URL, allowEmpty: true, onSubmit: value => {
+                    setStep({
+                        name: 'mistral-model',
+                        apiKey: step.apiKey,
+                        baseUrl: value.trim() || null,
+                        defaultModel: step.defaultModel,
+                    });
+                }, onCancel: () => setStep({
+                    name: 'mistral-key',
+                    defaultModel: step.defaultModel,
+                }) }));
+        case 'mistral-model':
+            return (React.createElement(TextEntryDialog, { resetStateKey: step.name, title: "Mistral setup", subtitle: "Step 3 of 3", description: `Enter a model name. Leave blank for ${step.defaultModel}.`, initialValue: defaults.mistralModel ?? step.defaultModel, placeholder: step.defaultModel, allowEmpty: true, onSubmit: value => {
+                    const env = buildMistralProfileEnv({
+                        model: value.trim() || step.defaultModel,
+                        baseUrl: step.baseUrl,
+                        apiKey: step.apiKey,
+                        processEnv: process.env,
+                    });
+                    if (env) {
+                        finishProfileSave(onDone, 'mistral', env);
+                    }
+                }, onCancel: () => setStep({
+                    name: 'mistral-base',
+                    apiKey: step.apiKey,
+                    defaultModel: step.defaultModel,
+                }) }));
+        case 'gemini-auth-method': {
+            const hasShellGeminiKey = Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
+            const hasShellGeminiAccessToken = Boolean(process.env.GEMINI_ACCESS_TOKEN);
+            const hasStoredGeminiAccessToken = Boolean(readGeminiAccessToken());
+            const hasAdc = mayHaveGeminiAdcCredentials(process.env);
+            const projectHint = getGeminiProjectIdHint(process.env);
+            const options = [
+                {
+                    label: 'API key',
+                    value: 'api-key',
+                    description: hasShellGeminiKey
+                        ? 'Use the current Gemini API key from this shell, or enter a new one'
+                        : 'Use a Google Gemini API key',
+                },
+                {
+                    label: 'Access token',
+                    value: 'access-token',
+                    description: hasShellGeminiAccessToken || hasStoredGeminiAccessToken
+                        ? `Use ${hasShellGeminiAccessToken
+                            ? 'the current GEMINI_ACCESS_TOKEN'
+                            : 'the securely stored Gemini access token'}`
+                        : 'Enter a Gemini access token and store it securely',
+                },
+                {
+                    label: 'Local ADC',
+                    value: 'adc',
+                    description: hasAdc
+                        ? `Use local Google ADC credentials${projectHint ? ` (project: ${projectHint})` : ''}`
+                        : 'Use local Google ADC credentials after running gcloud auth application-default login',
+                },
+            ];
+            return (React.createElement(Dialog, { title: "Gemini setup", onCancel: () => onDone() },
+                React.createElement(Box, { flexDirection: "column", gap: 1 },
+                    React.createElement(Text, null, "Choose how this Gemini profile should authenticate."),
+                    React.createElement(Select, { options: options, inlineDescriptions: true, visibleOptionCount: options.length, onChange: (value) => {
+                            if (value === 'api-key') {
+                                setStep({ name: 'gemini-key' });
+                            }
+                            else if (value === 'access-token') {
+                                setStep({ name: 'gemini-access-token' });
+                            }
+                            else {
+                                setStep({
+                                    name: 'gemini-model',
+                                    authMode: 'adc',
+                                });
+                            }
+                        }, onCancel: () => setStep({ name: 'choose' }) }))));
+        }
+        case 'gemini-key':
+            return (React.createElement(TextEntryDialog, { resetStateKey: step.name, title: "Gemini setup", subtitle: "Step 1 of 3", description: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY
+                    ? 'Enter a Gemini API key, or leave this blank to reuse the current GEMINI_API_KEY/GOOGLE_API_KEY from this session.'
+                    : 'Enter a Gemini API key. You can create one at https://aistudio.google.com/apikey.', initialValue: "", placeholder: "AIza...", mask: "*", allowEmpty: Boolean(process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY), onSubmit: value => {
+                    const apiKey = value.trim() ||
+                        process.env.GEMINI_API_KEY ||
+                        process.env.GOOGLE_API_KEY ||
+                        '';
+                    setStep({ name: 'gemini-model', apiKey, authMode: 'api-key' });
+                }, onCancel: () => setStep({ name: 'gemini-auth-method' }) }));
+        case 'gemini-access-token': {
+            const currentToken = process.env.GEMINI_ACCESS_TOKEN || readGeminiAccessToken() || '';
+            return (React.createElement(TextEntryDialog, { resetStateKey: step.name, title: "Gemini setup", subtitle: "Step 2 of 3", description: currentToken
+                    ? 'Enter a Gemini access token, or leave this blank to reuse the current token from this session or secure storage.'
+                    : 'Enter a Gemini access token. It will be stored securely for this profile.', initialValue: "", placeholder: "ya29....", mask: "*", allowEmpty: Boolean(currentToken), validate: value => {
+                    const token = value.trim() || currentToken;
+                    return token ? null : 'Enter a Gemini access token or go back and choose Local ADC.';
+                }, onSubmit: value => {
+                    const token = value.trim() || currentToken;
+                    const saved = saveGeminiAccessToken(token);
+                    if (!saved.success) {
+                        onDone(`Failed to save Gemini access token: ${saved.warning ?? 'unknown error'}`, {
+                            display: 'system',
+                        });
+                        return;
+                    }
+                    setStep({
+                        name: 'gemini-model',
+                        authMode: 'access-token',
+                    });
+                }, onCancel: () => setStep({ name: 'gemini-auth-method' }) }));
+        }
+        case 'gemini-model':
+            return (React.createElement(TextEntryDialog, { resetStateKey: step.name, title: "Gemini setup", subtitle: step.authMode === 'api-key'
+                    ? 'Step 3 of 3'
+                    : step.authMode === 'access-token'
+                        ? 'Step 3 of 3'
+                        : 'Step 2 of 2', description: step.authMode === 'api-key'
+                    ? `Enter a Gemini model name. Leave blank for ${DEFAULT_GEMINI_MODEL}.`
+                    : step.authMode === 'access-token'
+                        ? `Enter a Gemini model name. Leave blank for ${DEFAULT_GEMINI_MODEL}. This profile will use the stored Gemini access token at runtime.`
+                        : `Enter a Gemini model name. Leave blank for ${DEFAULT_GEMINI_MODEL}. This profile will use local Google ADC credentials at runtime.`, initialValue: defaults.geminiModel, placeholder: DEFAULT_GEMINI_MODEL, allowEmpty: true, onSubmit: value => {
+                    if (step.authMode === 'adc' &&
+                        !mayHaveGeminiAdcCredentials(process.env)) {
+                        onDone('Local ADC credentials were not detected. Run `gcloud auth application-default login` first, then save the Gemini ADC profile again.', {
+                            display: 'system',
+                        });
+                        return;
+                    }
+                    const env = buildGeminiProfileEnv({
+                        apiKey: step.apiKey,
+                        authMode: step.authMode,
+                        model: value.trim() || DEFAULT_GEMINI_MODEL,
+                        processEnv: {},
+                    });
+                    if (env) {
+                        finishProfileSave(onDone, 'gemini', env);
+                    }
+                }, onCancel: () => step.authMode === 'api-key'
+                    ? setStep({ name: 'gemini-key' })
+                    : step.authMode === 'access-token'
+                        ? setStep({ name: 'gemini-access-token' })
+                        : setStep({ name: 'gemini-auth-method' }) }));
+        case 'codex-check':
+            return (React.createElement(CodexCredentialStep, { onSave: (profile, env) => finishProfileSave(onDone, profile, env), onBack: () => setStep({ name: 'choose' }), onCancel: () => onDone() }));
+        case 'codex-oauth':
+            return (React.createElement(CodexOAuthStep, { onSave: (profile, env) => finishProfileSave(onDone, profile, env), onBack: () => setStep({ name: 'choose' }), onCancel: () => onDone() }));
+    }
+}
+export const call = async (onDone, _context, args) => {
+    const trimmedArgs = args?.trim().toLowerCase() ?? '';
+    if (COMMON_HELP_ARGS.includes(trimmedArgs) ||
+        COMMON_INFO_ARGS.includes(trimmedArgs) ||
+        trimmedArgs === 'help' ||
+        trimmedArgs === '--help' ||
+        trimmedArgs === '-h') {
+        onDone('Run /provider to add, edit, delete, or activate provider profiles. The active provider controls base URL, model, and API key.', { display: 'system' });
+        return;
+    }
+    return (React.createElement(ProviderManager, { mode: "manage", onDone: result => {
+            const message = result?.message ??
+                (result?.action === 'saved'
+                    ? 'Provider profile updated'
+                    : 'Provider manager closed');
+            onDone(message, { display: 'system' });
+        } }));
+};
+//# sourceMappingURL=provider.js.map

@@ -1,0 +1,1 @@
+{"version":3,"file":"index.js","sourceRoot":"","sources":["../../../../../engines/openclaude/src/commands/onboard-github/index.ts"],"names":[],"mappings":"AAEA,MAAM,aAAa,GAAY;IAC7B,IAAI,EAAE,gBAAgB;IACtB,OAAO,EAAE,CAAC,mBAAmB,EAAE,eAAe,EAAE,kBAAkB,CAAC;IACnE,WAAW,EACT,mFAAmF;IACrF,IAAI,EAAE,WAAW;IACjB,IAAI,EAAE,GAAG,EAAE,CAAC,MAAM,CAAC,qBAAqB,CAAC;CAC1C,CAAA;AAED,eAAe,aAAa,CAAA"}
