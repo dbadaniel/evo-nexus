@@ -6,8 +6,10 @@ const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const ClaudeBridge = require('./claude-bridge');
 const { ChatBridge } = require('./chat-bridge');
+const { OpenClaudeBridge } = require('./openclaude-bridge');
 const SessionStore = require('./utils/session-store');
 const ChatLogger = require('./utils/chat-logger');
+const { loadProviderConfig } = require('./utils/provider-utils');
 
 class TerminalServer {
   constructor(options = {}) {
@@ -21,6 +23,7 @@ class TerminalServer {
     this.globalSubscribers = new Set(); // wsIds subscribed to global notifications
     this.claudeBridge = new ClaudeBridge();
     this.chatBridge = new ChatBridge();
+    this.openClaudeBridge = new OpenClaudeBridge(this);
     this.sessionStore = new SessionStore();
     this.chatLogger = new ChatLogger(this.baseFolder);
     this.autoSaveInterval = null;
@@ -525,6 +528,18 @@ class TerminalServer {
             let isStreaming = false;
 
             try {
+              const providerConfig = loadProviderConfig();
+              // Use OpenClaude native engine for non-anthropic providers (OpenAI, Codex, etc.)
+              if (providerConfig.active !== 'anthropic') {
+                await this.openClaudeBridge.startSession(wsInfo.ws, wsInfo.claudeSessionId, {
+                  message: data.prompt,
+                  working_directory: chatSession.workingDir,
+                  model: providerConfig.env_vars.OPENAI_MODEL || providerConfig.env_vars.GEMINI_MODEL || data.model,
+                  files: data.files
+                });
+                return;
+              }
+
               await this.chatBridge.startSession(wsInfo.claudeSessionId, {
                 agentName: chatSession.agentName,
                 workingDir: chatSession.workingDir,
@@ -672,6 +687,7 @@ class TerminalServer {
       case 'chat_stop':
         if (wsInfo.claudeSessionId) {
           await this.chatBridge.stopSession(wsInfo.claudeSessionId);
+          this.openClaudeBridge.closeSession(wsInfo.claudeSessionId);
           const s = this.claudeSessions.get(wsInfo.claudeSessionId);
           if (s) s.active = false;
         }
@@ -680,6 +696,12 @@ class TerminalServer {
       case 'permission_response':
         if (wsInfo.claudeSessionId && data.requestId !== undefined) {
           this.chatBridge.respondToApproval(wsInfo.claudeSessionId, data.requestId, !!data.approved);
+          // For OpenClaude, we use approval_response action
+          this.openClaudeBridge.handleMessage(wsInfo.claudeSessionId, {
+            action: 'approval_response',
+            prompt_id: data.requestId,
+            response: data.approved ? 'allow' : 'deny'
+          });
         }
         break;
 
