@@ -270,6 +270,11 @@ function splitJsonLines(buffer) {
   return { lines: lines.filter(Boolean), rest };
 }
 
+function looksLikeCliJsonStream(text) {
+  const trimmed = (text || '').trimStart();
+  return trimmed.startsWith('{"type":"') || trimmed.startsWith("{'type':");
+}
+
 function buildCliUserMessage(prompt, files) {
   const content = [];
 
@@ -395,6 +400,10 @@ function buildRuntimeContextBlock(agentName, sessionId) {
   runtimeLines.push('Read/Glob/Grep/WebFetch/ToolSearch/Skill run automatically.');
   runtimeLines.push('Write/Edit/Bash/Agent/NotebookEdit need user approval per call when the provider supports approval callbacks in this environment.');
   runtimeLines.push('Do not ask for permission in plain text for safe read/search tools.');
+  runtimeLines.push('');
+  runtimeLines.push('## Shell compatibility');
+  runtimeLines.push('Prefer simple POSIX shell commands. On Linux, use `python3` instead of `python` unless you have verified `python` exists.');
+  runtimeLines.push('Avoid inline Python tuple/set assignment syntax such as `terms=(...)` inside `python3 -c` Bash commands, because permission parsers can mistake it for shell process substitution. Prefer heredocs (`python3 <<\'PY\' ... PY`) or newline-safe scripts.');
   return runtimeLines.join('\n');
 }
 
@@ -995,7 +1004,8 @@ class ChatBridge {
 
       console.error(`[chat-bridge] CLI session ${sessionId} failed: stderr=${JSON.stringify(rawStderr.slice(0, 500))} stdout=${JSON.stringify(rawStdout.slice(0, 500))}`);
       const { resultText } = extractCliResult(rawStdout);
-      const error = new Error(rawStderr || resultText || `CLI exited with code ${code}`);
+      const safeResultText = looksLikeCliJsonStream(resultText) ? '' : resultText;
+      const error = new Error(rawStderr || safeResultText || `CLI exited with code ${code}`);
       if (onError) onError(error);
     });
 

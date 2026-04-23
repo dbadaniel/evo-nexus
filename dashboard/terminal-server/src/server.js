@@ -4,6 +4,16 @@ const path = require('path');
 const WebSocket = require('ws');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+
+function safeText(value) {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
 const ClaudeBridge = require('./claude-bridge');
 const { ChatBridge } = require('./chat-bridge');
 const SessionStore = require('./utils/session-store');
@@ -693,10 +703,10 @@ class TerminalServer {
                       type: 'permission_request',
                       sessionId: wsInfo.claudeSessionId,
                       requestId: msg.requestId,
-                      toolName: msg.toolName,
+                      toolName: safeText(msg.toolName) || 'Tool',
                       input: msg.input,
-                      title: msg.title || null,
-                      description: msg.description || null,
+                      title: safeText(msg.title),
+                      description: safeText(msg.description),
                     };
                     this.broadcastToSession(wsInfo.claudeSessionId, permPayload);
                     // Global notification

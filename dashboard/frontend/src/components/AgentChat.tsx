@@ -34,6 +34,11 @@ interface PermissionRequest {
   createdAt: number
 }
 
+function safeRecord(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
+  return {}
+}
+
 interface AgentChatProps {
   agent: string
   sessionId?: string
@@ -452,11 +457,11 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
           case 'permission_request':
             if (msg.requestId) {
               setPendingApprovals(prev => [...prev, {
-                requestId: msg.requestId,
-                toolName: msg.toolName,
-                input: msg.input || {},
-                title: msg.title || null,
-                description: msg.description || null,
+                requestId: safeText(msg.requestId),
+                toolName: safeText(msg.toolName || 'Tool'),
+                input: safeRecord(msg.input),
+                title: msg.title === undefined || msg.title === null ? null : safeText(msg.title),
+                description: msg.description === undefined || msg.description === null ? null : safeText(msg.description),
                 createdAt: Date.now(),
               }])
               // Request OS notification permission silently on first request
@@ -472,7 +477,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
               ) {
                 try {
                   const n = new Notification(`Agent @${agent} is waiting for your approval`, {
-                    body: msg.title || msg.toolName || 'Permission request',
+                    body: safeText(msg.title || msg.toolName || 'Permission request'),
                     icon: '/favicon.ico',
                     tag: `approval-${msg.requestId}`,
                   })
