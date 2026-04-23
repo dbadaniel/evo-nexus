@@ -23,6 +23,16 @@
 
 ---
 
+## Nota de bastidores
+
+Pessoal, fiz aqui algumas alteracoes para o OpenClaude funcionar de um jeito bem mais nativo dentro do dashboard. A ideia foi deixar o chat menos "terminal disfarçado" e mais integrado de verdade: reconhecer melhor os agentes, manter contexto entre mensagens, lidar melhor com anexos e mostrar pedidos de permissao na interface com botoes de `Allow` / `Deny`.
+
+Ainda tem coisa para polir, principalmente na parte de perguntas interativas e imagem, mas ja esta bem mais perto da experiencia que eu queria: abrir o dashboard, conversar com os agentes e deixar o OpenClaude trabalhar sem parecer gambiarra colada com fita isolante.
+
+E, como ninguem vive so de arquitetura, fica a campanha informal: se este projeto te economizou umas horas, aceitamos patrocinio para mais tokens do Claude no Pix `expertsa.oficial@gmail.com`. Prometemos usar com responsabilidade, ou pelo menos com logs em JSONL.
+
+---
+
 ## What It Is
 
 EvoNexus is an open source, **unofficial** multi-agent operating layer built around the [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI protocol — but **not locked to any single LLM provider**. It runs natively on Anthropic's `claude` CLI by default, and can transparently switch to OpenAI, Google Gemini, OpenRouter (200+ models), AWS Bedrock, Google Vertex AI, or Codex Auth via [OpenClaude](https://www.npmjs.com/package/@gitlawb/openclaude). Same agents, same skills, same workflows — your choice of backend.

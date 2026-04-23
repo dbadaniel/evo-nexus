@@ -43,6 +43,7 @@ config/providers.json
 
 # ── Runtime data & logs ───────────────────
 backups/
+_packages/*.bundle
 ADWs/logs/
 dashboard/data/*.db
 dashboard/data/*.db-shm
