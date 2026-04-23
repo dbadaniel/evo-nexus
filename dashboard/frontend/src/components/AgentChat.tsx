@@ -40,6 +40,8 @@ interface AgentChatProps {
   accentColor?: string
   externalLoading?: boolean
   externalError?: string | null
+  onSessionCreated?: (session: { id: string; name: string; active: boolean; ts: number }) => void
+  onSessionMetaChange?: (sessionId: string, patch: { active?: boolean; preview?: string; ts?: number; ticketId?: string | null }) => void
   onPendingCountChange?: (sessionId: string, count: number) => void
   onNeedsAttention?: (sessionId: string) => void
 }
@@ -69,11 +71,226 @@ type ChatMessage =
 type AssistantBlock =
   | { type: 'text'; text: string }
   | { type: 'thinking'; text: string }
-  | { type: 'tool_use'; toolName: string; toolId: string; input: string; result?: string; done?: boolean; subagentType?: string; subagentStatus?: string; subagentSummary?: string; subagentTools?: Array<{ toolName: string; input: string; toolUseId: string; ts: number }> }
+  | { type: 'tool_use'; toolName: string; toolId: string; input: string; result?: string; done?: boolean; subagentType?: string; subagentStatus?: string; subagentSummary?: string; subagentTools?: Array<{ toolName: string; input: string; toolUseId: string; ts: number }>; elicitationRequestId?: string; elicitationMode?: 'form' | 'url'; elicitationMessage?: string; elicitationRequestedSchema?: unknown; elicitationSubmitted?: boolean }
 
 type Status = 'idle' | 'connecting' | 'running' | 'error'
 
-export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', externalLoading = false, externalError = null, onPendingCountChange, onNeedsAttention }: AgentChatProps) {
+function safeText(value: unknown) {
+  if (typeof value === 'string') return value
+  if (value === null || value === undefined) return ''
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function getToolLabel(toolName: string) {
+  switch (toolName) {
+    case 'Bash':
+      return 'Bash'
+    case 'AskUserQuestion':
+      return 'AskUserQuestion'
+    case 'TodoWrite':
+      return 'TodoWrite'
+    default:
+      return safeText(toolName)
+  }
+}
+
+function getToolIcon(toolName: string, accentColor: string, size = 13, className = '') {
+  const props = { size, className, style: className ? undefined : { color: accentColor } }
+
+  switch (toolName) {
+    case 'Bash':
+      return <TermIcon {...props} />
+    case 'Read':
+      return <FileText {...props} />
+    case 'Write':
+    case 'Edit':
+      return <Edit2 {...props} />
+    case 'AskUserQuestion':
+      return <ShieldAlert {...props} />
+    case 'TodoWrite':
+      return <CheckCircle2 {...props} />
+    default:
+      return <FileCode {...props} />
+  }
+}
+
+function summarizeToolInput(toolName: string, parsedInput: any, rawInput = '') {
+  if (toolName === 'Bash') {
+    return safeText(parsedInput?.command || rawInput).replace(/\s+/g, ' ').trim()
+  }
+
+  if (toolName === 'Read') {
+    return safeText(parsedInput?.file_path || parsedInput?.path || rawInput)
+  }
+
+  if (toolName === 'Write' || toolName === 'Edit') {
+    return safeText(parsedInput?.file_path || parsedInput?.path || rawInput)
+  }
+
+  if (toolName === 'Glob') {
+    return safeText(parsedInput?.pattern || parsedInput?.path || rawInput)
+  }
+
+  if (toolName === 'Grep') {
+    return safeText(parsedInput?.pattern || parsedInput?.query || rawInput)
+  }
+
+  if (toolName === 'AskUserQuestion') {
+    const questions = Array.isArray(parsedInput?.questions) ? parsedInput.questions : []
+    const firstQuestion = safeText(questions[0]?.question || '')
+    if (questions.length === 0) return ''
+    return questions.length === 1 ? firstQuestion : `${questions.length} questions`
+  }
+
+  if (toolName === 'TodoWrite') {
+    const todos = Array.isArray(parsedInput?.todos) ? parsedInput.todos : []
+    const completed = todos.filter((todo: any) => todo?.status === 'completed').length
+    return todos.length > 0 ? `${completed}/${todos.length} done` : ''
+  }
+
+  return safeText(
+    parsedInput?.command
+    || parsedInput?.file_path
+    || parsedInput?.path
+    || parsedInput?.pattern
+    || parsedInput?.description
+    || rawInput,
+  )
+}
+
+function getToolDetailRows(toolName: string, parsedInput: any) {
+  if (toolName === 'Bash') {
+    const command = safeText(parsedInput?.command || '').replace(/\s+/g, ' ').trim()
+    return {
+      primary: command,
+      secondary: '',
+      chips: [
+        parsedInput?.timeout ? `${parsedInput.timeout}ms` : '',
+        parsedInput?.run_in_background ? 'background' : '',
+      ].filter(Boolean) as string[],
+    }
+  }
+
+  if (toolName === 'Read') {
+    const filePath = safeText(parsedInput?.file_path || parsedInput?.path || '')
+    const pages = Array.isArray(parsedInput?.pages) && parsedInput.pages.length > 0
+      ? `pages ${parsedInput.pages.join(', ')}`
+      : ''
+    const offset = parsedInput?.offset !== undefined && parsedInput?.offset !== null ? `offset ${parsedInput.offset}` : ''
+    const limit = parsedInput?.limit ? `limit ${parsedInput.limit}` : ''
+    return {
+      primary: filePath,
+      secondary: '',
+      chips: [pages, offset, limit].filter(Boolean) as string[],
+    }
+  }
+
+  if (toolName === 'Write' || toolName === 'Edit') {
+    const filePath = safeText(parsedInput?.file_path || parsedInput?.path || '')
+    return {
+      primary: filePath,
+      secondary: '',
+      chips: [],
+    }
+  }
+
+  if (toolName === 'Glob') {
+    return {
+      primary: safeText(parsedInput?.pattern || ''),
+      secondary: safeText(parsedInput?.path || ''),
+      chips: [],
+    }
+  }
+
+  if (toolName === 'Grep') {
+    return {
+      primary: safeText(parsedInput?.pattern || parsedInput?.query || ''),
+      secondary: safeText(parsedInput?.path || ''),
+      chips: [],
+    }
+  }
+
+  return {
+    primary: summarizeToolInput(toolName, parsedInput),
+    secondary: '',
+    chips: [],
+  }
+}
+
+function normalizeAssistantBlock(block: any): AssistantBlock {
+  if (!block || typeof block !== 'object') {
+    return { type: 'text', text: safeText(block) }
+  }
+
+  if (block.type === 'text' || block.type === 'thinking') {
+    return { ...block, text: safeText(block.text) }
+  }
+
+  if (block.type === 'tool_use') {
+    return {
+      ...block,
+      toolName: safeText(block.toolName || block.name),
+      toolId: safeText(block.toolId || block.id),
+      input: safeText(block.input),
+      result: block.result === undefined ? undefined : safeText(block.result),
+      subagentType: block.subagentType ? safeText(block.subagentType) : undefined,
+      subagentStatus: block.subagentStatus ? safeText(block.subagentStatus) : undefined,
+      subagentSummary: block.subagentSummary ? safeText(block.subagentSummary) : undefined,
+      subagentTools: Array.isArray(block.subagentTools)
+        ? block.subagentTools.map((tool: any) => ({
+            toolName: safeText(tool?.toolName),
+            input: safeText(tool?.input),
+            toolUseId: safeText(tool?.toolUseId),
+            ts: typeof tool?.ts === 'number' ? tool.ts : Date.now(),
+          }))
+        : undefined,
+      elicitationRequestId: block.elicitationRequestId ? safeText(block.elicitationRequestId) : undefined,
+      elicitationMode: block.elicitationMode === 'url' ? 'url' : 'form',
+      elicitationMessage: block.elicitationMessage ? safeText(block.elicitationMessage) : undefined,
+      elicitationRequestedSchema: block.elicitationRequestedSchema,
+      elicitationSubmitted: !!block.elicitationSubmitted,
+      done: block.done === undefined ? undefined : !!block.done,
+    }
+  }
+
+  return { type: 'text', text: safeText(block.text ?? block) }
+}
+
+function normalizeChatMessage(message: any): ChatMessage {
+  if (message?.role === 'assistant') {
+    const blocks = Array.isArray(message.blocks) ? message.blocks.map(normalizeAssistantBlock) : []
+    return {
+      role: 'assistant',
+      blocks,
+      ts: typeof message.ts === 'number' ? message.ts : Date.now(),
+      streaming: !!message.streaming,
+      uuid: message.uuid,
+    }
+  }
+
+  if (message?.role === 'system') {
+    return {
+      role: 'system',
+      text: safeText(message.text),
+      ts: typeof message.ts === 'number' ? message.ts : Date.now(),
+      uuid: message.uuid,
+    }
+  }
+
+  return {
+    role: 'user',
+    text: safeText(message?.text),
+    files: Array.isArray(message?.files) ? message.files : undefined,
+    ts: typeof message?.ts === 'number' ? message.ts : Date.now(),
+    uuid: message?.uuid,
+  }
+}
+
+export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', externalLoading = false, externalError = null, onSessionCreated, onSessionMetaChange, onPendingCountChange, onNeedsAttention }: AgentChatProps) {
   const { dismissBySession } = useNotifications()
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
@@ -90,6 +307,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
     open: false, query: '', items: [], selectedIndex: 0, anchorStart: -1,
   })
   const [pendingApprovals, setPendingApprovals] = useState<PermissionRequest[]>([])
+  const [latestElicitationRequestId, setLatestElicitationRequestId] = useState<string | null>(null)
   const [editingUuid, setEditingUuid] = useState<string | null>(null)
   const [editingText, setEditingText] = useState('')
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null)
@@ -100,6 +318,14 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
   const pingRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const dragCounterRef = useRef(0)
   const subagentToolRef = useRef<{ toolName: string; toolUseId: string; input: string; parentToolUseId: string } | null>(null)
+  const latestElicitationRequestIdRef = useRef<string | null>(null)
+  const pendingElicitationsRef = useRef<Array<{
+    requestId: string
+    mode?: 'form' | 'url'
+    message?: string
+    requestedSchema?: unknown
+  }>>([])
+  const pendingInitialSendRef = useRef<{ text: string; files: AttachedFile[] } | null>(null)
 
   // Auto-dismiss global notifications when the user opens this session
   useEffect(() => {
@@ -108,12 +334,26 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
     }
   }, [sessionId, dismissBySession])
 
+  useEffect(() => {
+    latestElicitationRequestIdRef.current = latestElicitationRequestId
+  }, [latestElicitationRequestId])
+
   // Notify parent when pending approvals count changes
   useEffect(() => {
     if (sessionId && onPendingCountChange) {
       onPendingCountChange(sessionId, pendingApprovals.length)
     }
   }, [pendingApprovals.length, sessionId, onPendingCountChange])
+
+  useEffect(() => {
+    if (!sessionId) {
+      setMessages([])
+      setPendingApprovals([])
+      setTicketId(null)
+      setStatus('idle')
+      setErrorMsg(null)
+    }
+  }, [sessionId])
 
   // Auto-scroll to bottom
   const scrollToBottom = useCallback(() => {
@@ -128,6 +368,9 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
   useEffect(() => {
     if (!sessionId) return
 
+    setMessages([])
+    setPendingApprovals([])
+    setTicketId(null)
     setStatus('connecting')
     setErrorMsg(null)
     let cancelled = false
@@ -166,20 +409,26 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
             // Restore chat history from server — preserve uuid from each message
             if (msg.chatHistory && msg.chatHistory.length > 0) {
               setMessages(msg.chatHistory.map((m: any) => ({
-                ...m,
-                uuid: m.uuid,
+                ...normalizeChatMessage(m),
                 streaming: false,
               })))
               scrollToBottom()
             }
             // Restore ticket binding (Feature 1.3)
             setTicketId(msg.ticketId || null)
+            if (sessionId) {
+              onSessionMetaChange?.(sessionId, {
+                active: false,
+                ts: Date.now(),
+                ticketId: msg.ticketId || null,
+              })
+            }
             break
 
           case 'chat_history':
             // Fallback history restore
             if (msg.messages?.length > 0) {
-              setMessages(msg.messages.map((m: any) => ({ ...m, streaming: false })))
+              setMessages(msg.messages.map((m: any) => ({ ...normalizeChatMessage(m), streaming: false })))
               scrollToBottom()
             }
             break
@@ -191,6 +440,12 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
           case 'ticket_bound':
             if (msg.ticketId) {
               setTicketId(msg.ticketId)
+              if (sessionId) {
+                onSessionMetaChange?.(sessionId, {
+                  ticketId: msg.ticketId,
+                  ts: Date.now(),
+                })
+              }
             }
             break
 
@@ -229,18 +484,37 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
             }
             break
 
+          case 'elicitation_request':
+            if (msg.requestId) {
+              handleChatEvent(msg)
+            }
+            break
+
           case 'chat_error':
             setStatus('error')
             setIsThinking(false)
             setPendingApprovals([])
             setErrorMsg(msg.message || 'Unknown error')
             setMessages(prev => [...prev, { role: 'system', text: `Error: ${msg.message}`, ts: Date.now() }])
+            if (sessionId) {
+              onSessionMetaChange?.(sessionId, {
+                active: false,
+                preview: `Error: ${msg.message || 'Unknown error'}`,
+                ts: Date.now(),
+              })
+            }
             break
 
           case 'chat_complete':
             setStatus('idle')
             setIsThinking(false)
             setPendingApprovals([])
+            if (sessionId) {
+              onSessionMetaChange?.(sessionId, {
+                active: false,
+                ts: Date.now(),
+              })
+            }
             // Signal unread response when user is in another tab
             if (document.hidden && sessionId && onNeedsAttention) {
               onNeedsAttention(sessionId)
@@ -285,7 +559,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
       try { ws?.close() } catch {}
       wsRef.current = null
     }
-  }, [sessionId])
+  }, [sessionId, agent, onNeedsAttention, onSessionMetaChange, scrollToBottom])
 
   // Revoke object URLs on unmount
   useEffect(() => {
@@ -320,6 +594,66 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
       })
       .catch(() => {})
   }, [showTicketPicker, agent])
+
+  const performSend = useCallback(async (text: string, filesSnapshot: AttachedFile[]) => {
+    if ((!text && filesSnapshot.length === 0) || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+
+    const fileMeta: FileRef[] = filesSnapshot.map(f => ({
+      name: f.name,
+      type: f.type,
+      previewUrl: f.previewUrl,
+    }))
+
+    const filesForServer: FileRef[] = []
+    for (const af of filesSnapshot) {
+      const base64 = await fileToBase64(af.file)
+      filesForServer.push({
+        name: af.name,
+        type: af.type,
+        base64,
+      })
+    }
+
+    setMessages(prev => [...prev, {
+      role: 'user' as const,
+      text,
+      files: fileMeta.length > 0 ? fileMeta : undefined,
+      ts: Date.now(),
+    }])
+
+    setInput('')
+    setAttachedFiles([])
+    setStatus('running')
+    setErrorMsg(null)
+    if (sessionId) {
+      onSessionMetaChange?.(sessionId, {
+        active: true,
+        preview: text || (filesSnapshot.length > 0 ? `[${filesSnapshot.length} attachment${filesSnapshot.length > 1 ? 's' : ''}]` : ''),
+        ts: Date.now(),
+      })
+    }
+
+    wsRef.current.send(JSON.stringify({
+      type: 'chat_send',
+      prompt: text,
+      files: filesForServer.length > 0 ? filesForServer : undefined,
+    }))
+
+    scrollToBottom()
+    if (inputRef.current) {
+      inputRef.current.style.height = 'auto'
+      inputRef.current.focus()
+    }
+  }, [scrollToBottom, sessionId, onSessionMetaChange])
+
+  useEffect(() => {
+    if (!sessionId || !pendingInitialSendRef.current) return
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || status !== 'idle') return
+
+    const pending = pendingInitialSendRef.current
+    pendingInitialSendRef.current = null
+    void performSend(pending.text, pending.files)
+  }, [sessionId, status, performSend])
 
   const bindTicket = useCallback(async (newTicketId: string | null) => {
     if (!sessionId) return
@@ -363,6 +697,28 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
     wsRef.current.send(JSON.stringify({ type: 'permission_response', requestId, approved }))
     setPendingApprovals(prev => prev.filter(r => r.requestId !== requestId))
+  }, [])
+
+  const respondToElicitation = useCallback((requestId: string, content: Record<string, unknown>) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return false
+    wsRef.current.send(JSON.stringify({
+      type: 'elicitation_response',
+      requestId,
+      action: 'accept',
+      content,
+    }))
+    setMessages(prev => prev.map(msg => {
+      if (msg.role !== 'assistant') return msg
+      const blocks = (msg as any).blocks?.map((block: AssistantBlock) => {
+        if (block.type === 'tool_use' && block.elicitationRequestId === requestId) {
+          return { ...block, elicitationSubmitted: true }
+        }
+        return block
+      })
+      return blocks ? { ...msg, blocks } : msg
+    }))
+    setLatestElicitationRequestId(prev => (prev === requestId ? null : prev))
+    return true
   }, [])
 
   const handleChatEvent = useCallback((msg: any) => {
@@ -430,12 +786,20 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
           const last = copy[copy.length - 1]
           if (last?.role === 'assistant') {
             const blocks = [...(last as any).blocks]
+            const pendingElicitation = msg.toolName === 'AskUserQuestion'
+              ? pendingElicitationsRef.current.shift()
+              : undefined
             blocks.push({
               type: 'tool_use',
               toolName: msg.toolName,
               toolId: msg.toolId,
               input: '',
               done: false,
+              elicitationRequestId: pendingElicitation?.requestId,
+              elicitationMode: pendingElicitation?.mode || 'form',
+              elicitationMessage: pendingElicitation?.message || '',
+              elicitationRequestedSchema: pendingElicitation?.requestedSchema ?? null,
+              elicitationSubmitted: false,
             })
             copy[copy.length - 1] = { ...last, blocks } as any
           }
@@ -562,6 +926,46 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
           break
         }
 
+        case 'elicitation_request': {
+          let attached = false
+          for (let mi = copy.length - 1; mi >= 0; mi--) {
+            const m = copy[mi]
+            if (m.role !== 'assistant') continue
+            const blocks = [...(m as any).blocks]
+            let found = false
+            for (let bi = blocks.length - 1; bi >= 0; bi--) {
+              const block = blocks[bi]
+              if (block.type !== 'tool_use' || block.toolName !== 'AskUserQuestion') continue
+              if (block.elicitationRequestId) continue
+              blocks[bi] = {
+                ...block,
+                elicitationRequestId: msg.requestId,
+                elicitationMode: msg.mode || 'form',
+                elicitationMessage: msg.message || '',
+                elicitationRequestedSchema: msg.requestedSchema || null,
+                elicitationSubmitted: false,
+              }
+              copy[mi] = { ...m, blocks } as any
+              found = true
+              attached = true
+              break
+            }
+            if (found) break
+          }
+          if (!attached && msg.requestId) {
+            pendingElicitationsRef.current.push({
+              requestId: msg.requestId,
+              mode: msg.mode || 'form',
+              message: msg.message || '',
+              requestedSchema: msg.requestedSchema || null,
+            })
+          }
+          if (msg.requestId) {
+            setLatestElicitationRequestId(msg.requestId)
+          }
+          break
+        }
+
         case 'result': {
           const last = copy[copy.length - 1]
           if (last?.role === 'assistant') {
@@ -576,6 +980,11 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
 
       return copy
     })
+
+    if (msg.type === 'result') {
+      setStatus('idle')
+      setIsThinking(false)
+    }
 
     scrollToBottom()
     if (msg.type === 'text_start' || msg.type === 'message_start') {
@@ -739,50 +1148,37 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
   // Send message
   const sendMessage = useCallback(async () => {
     const text = input.trim()
-    if ((!text && attachedFiles.length === 0) || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+    if (!text && attachedFiles.length === 0) return
 
-    // Build file refs for display
-    const fileMeta: FileRef[] = attachedFiles.map(f => ({
-      name: f.name,
-      type: f.type,
-      previewUrl: f.previewUrl,
-    }))
-
-    // Build files with base64 for server
-    const filesForServer: FileRef[] = []
-    for (const af of attachedFiles) {
-      const base64 = await fileToBase64(af.file)
-      filesForServer.push({
-        name: af.name,
-        type: af.type,
-        base64,
-      })
+    if (!sessionId) {
+      if (status === 'connecting') return
+      pendingInitialSendRef.current = { text, files: [...attachedFiles] }
+      setStatus('connecting')
+      setErrorMsg(null)
+      try {
+        const res = await fetch(`${TS_HTTP}/api/sessions/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agentName: agent }),
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data = await res.json()
+        onSessionCreated?.({
+          id: data.sessionId,
+          name: data.session?.name || agent,
+          active: data.session?.active ?? false,
+          ts: Date.now(),
+        })
+      } catch {
+        pendingInitialSendRef.current = null
+        setStatus('error')
+        setErrorMsg(`Could not reach terminal-server at ${TS_HTTP}. Is it running?`)
+      }
+      return
     }
 
-    setMessages(prev => [...prev, {
-      role: 'user' as const,
-      text,
-      files: fileMeta.length > 0 ? fileMeta : undefined,
-      ts: Date.now(),
-    }])
-
-    setInput('')
-    setAttachedFiles([])
-    setStatus('running')
-    setErrorMsg(null)
-
-    wsRef.current.send(JSON.stringify({
-      type: 'chat_send',
-      prompt: text,
-      files: filesForServer.length > 0 ? filesForServer : undefined,
-    }))
-
-    scrollToBottom()
-    if (inputRef.current) {
-      inputRef.current.style.height = 'auto'
-      inputRef.current.focus()
-    }
-  }, [input, attachedFiles, scrollToBottom])
+    await performSend(text, attachedFiles)
+  }, [agent, input, attachedFiles, sessionId, status, onSessionCreated, performSend])
 
   // Detect slash-command region from caret position
   const detectSlash = useCallback((text: string, caret: number) => {
@@ -990,7 +1386,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
       {/* Pending approval badge */}
       {pendingApprovals.length > 0 && (
         <div
-          className="absolute top-3 z-40 flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[10px] animate-pulse"
+          className="absolute top-3 z-40 flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[10px] shadow-sm"
           style={{
             right: sessionId ? '12px' : '12px',
             background: '#F59E0B15',
@@ -999,7 +1395,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
           }}
         >
           <ShieldAlert size={11} />
-          <span>{pendingApprovals.length === 1 ? 'Awaiting your approval' : `${pendingApprovals.length} awaiting approval`}</span>
+          <span>{pendingApprovals.length === 1 ? 'Approval required' : `${pendingApprovals.length} approvals required`}</span>
         </div>
       )}
 
@@ -1019,13 +1415,13 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
             <Upload size={24} style={{ color: accentColor }} />
           </div>
           <p className="text-sm font-medium" style={{ color: accentColor }}>
-            Solte os arquivos aqui
+            Drop files here
           </p>
         </div>
       )}
 
       {/* Messages area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6 pb-24 space-y-5">
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center">
             <div
@@ -1157,7 +1553,19 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
                         </div>
                       )}
                       {block.type === 'tool_use' && (
-                        <ToolCard block={block} accentColor={accentColor} />
+                        <ToolCard
+                          block={block}
+                          accentColor={accentColor}
+                          fallbackElicitationRequestId={latestElicitationRequestId}
+                          resolveFallbackElicitationRequestId={() => {
+                            const pendingTail = pendingElicitationsRef.current[pendingElicitationsRef.current.length - 1]
+                            return latestElicitationRequestIdRef.current || pendingTail?.requestId || null
+                          }}
+                          onSubmitElicitation={async (requestId, content) => {
+                            return respondToElicitation(requestId, content)
+                          }}
+                          onSendPrompt={(prompt) => performSend(prompt, [])}
+                        />
                       )}
                     </div>
                   ))}
@@ -1206,13 +1614,15 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
           />
         ))}
 
-        {/* Global thinking indicator when running but no assistant message yet */}
+        {/* Global neutral indicator while the assistant has not emitted a visible block yet */}
         {status === 'running' && messages[messages.length - 1]?.role !== 'assistant' && (
           <div className="flex gap-3">
             <div className="flex-shrink-0 mt-0.5">
               <AgentAvatar name={agent} size={28} />
             </div>
-            <TypingIndicator accentColor={accentColor} isThinking />
+            <div>
+              <TypingIndicator accentColor={accentColor} isThinking={isThinking} />
+            </div>
           </div>
         )}
       </div>
@@ -1308,7 +1718,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
             <button
               onClick={() => fileInputRef.current?.click()}
               className="flex-shrink-0 flex items-center justify-center w-7 h-7 rounded-lg text-[#667085] hover:text-[#e6edf3] hover:bg-[#21262d] transition-colors mb-0.5"
-              title="Anexar arquivo"
+              title="Attach file"
             >
               <Paperclip size={14} />
             </button>
@@ -1389,8 +1799,9 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
 // ── Sub-components ──
 
 function TypingIndicator({ accentColor, isThinking }: { accentColor: string; isThinking?: boolean }) {
+  void isThinking
   return (
-    <div className="flex items-center gap-2 py-1">
+    <div className="flex items-center py-1">
       <div className="flex items-center gap-1">
         {[0, 1, 2].map((i) => (
           <span
@@ -1404,12 +1815,6 @@ function TypingIndicator({ accentColor, isThinking }: { accentColor: string; isT
           />
         ))}
       </div>
-      <span
-        className="text-[10px] text-[#667085]"
-        style={{ animation: 'chat-pulse 2s ease-in-out infinite' }}
-      >
-        {isThinking ? 'Thinking...' : 'Typing...'}
-      </span>
     </div>
   )
 }
@@ -1423,7 +1828,7 @@ function AgentInputToggle({ parsedInput, rawInput }: { parsedInput: any; rawInpu
         className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] text-[#667085] hover:text-[#8b949e] transition-colors w-full"
       >
         {showInput ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-        View input
+        Input
       </button>
       {showInput && (
         <pre className="px-3 pb-2 text-[11px] text-[#8b949e] font-mono whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
@@ -1434,29 +1839,31 @@ function AgentInputToggle({ parsedInput, rawInput }: { parsedInput: any; rawInpu
   )
 }
 
-function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { type: 'tool_use' }>; accentColor: string }) {
+function ToolCard({ block, accentColor, onSubmitElicitation, onSendPrompt, fallbackElicitationRequestId, resolveFallbackElicitationRequestId }: { block: Extract<AssistantBlock, { type: 'tool_use' }>; accentColor: string; onSubmitElicitation?: (requestId: string, content: Record<string, unknown>) => Promise<boolean> | boolean; onSendPrompt?: (prompt: string) => Promise<void> | void; fallbackElicitationRequestId?: string | null; resolveFallbackElicitationRequestId?: () => string | null }) {
+  const normalizedBlock = normalizeAssistantBlock(block) as Extract<AssistantBlock, { type: 'tool_use' }>
   const [open, setOpen] = useState(false)
+  const [askAnswers, setAskAnswers] = useState<Record<number, string[]>>({})
+  const [askOtherText, setAskOtherText] = useState<Record<number, string>>({})
+  const [sendingAskAnswers, setSendingAskAnswers] = useState(false)
+  const [askFallbackSubmitted, setAskFallbackSubmitted] = useState(false)
 
   let parsedInput: any = null
-  try { parsedInput = JSON.parse(block.input) } catch {}
+  if (typeof normalizedBlock.input === 'string') {
+    try { parsedInput = JSON.parse(normalizedBlock.input) } catch {}
+  } else if (normalizedBlock.input && typeof normalizedBlock.input === 'object') {
+    parsedInput = normalizedBlock.input
+  }
 
   // Detect Agent/SendMessage tools — render special subagent card
-  const isAgentTool = block.toolName === 'Agent' || block.toolName === 'SendMessage'
-  const subagentName = parsedInput?.subagent_type || parsedInput?.name || parsedInput?.to || ''
-  const subagentDesc = parsedInput?.description || parsedInput?.summary || block.subagentType || ''
+  const isAgentTool = normalizedBlock.toolName === 'Agent' || normalizedBlock.toolName === 'SendMessage'
+  const subagentName = safeText(parsedInput?.subagent_type || parsedInput?.name || parsedInput?.to || '')
 
   if (isAgentTool) {
-    const isRunning = block.subagentStatus === 'running'
-    const isDone = block.done || block.subagentStatus === 'completed' || block.subagentStatus === 'failed'
-    const subagentTools = block.subagentTools || []
+    const isRunning = normalizedBlock.subagentStatus === 'running'
+    const isDone = normalizedBlock.done || normalizedBlock.subagentStatus === 'completed' || normalizedBlock.subagentStatus === 'failed'
+    const isFailed = normalizedBlock.subagentStatus === 'failed'
+    const subagentTools = normalizedBlock.subagentTools || []
     const toolCount = subagentTools.length
-
-    const getToolIcon = (toolName: string) => {
-      if (toolName === 'Bash') return <TermIcon size={11} className="text-[#667085] flex-shrink-0" />
-      if (toolName === 'Read') return <FileText size={11} className="text-[#667085] flex-shrink-0" />
-      if (toolName === 'Edit' || toolName === 'Write') return <Edit2 size={11} className="text-[#667085] flex-shrink-0" />
-      return <FileCode size={11} className="text-[#667085] flex-shrink-0" />
-    }
 
     return (
       <div className="border border-[#21262d] rounded-lg overflow-hidden">
@@ -1473,59 +1880,51 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
             return displayName ? (
               <AgentAvatar name={displayName.replace('custom-', '')} size={20} />
             ) : (
-              <FileCode size={13} style={{ color: accentColor }} />
+              getToolIcon(normalizedBlock.toolName, accentColor)
             )
           })()}
 
           <span className="font-medium text-[#e6edf3]">
             {(() => {
               const isUuid = /^[0-9a-f]{8,}$/i.test(subagentName)
-              return isUuid ? (block.toolName === 'SendMessage' ? 'SendMessage' : 'Agent') : subagentName ? `@${subagentName}` : block.toolName
+              return isUuid ? getToolLabel(normalizedBlock.toolName) : subagentName ? `@${subagentName}` : getToolLabel(normalizedBlock.toolName)
             })()}
           </span>
-          {subagentDesc && (
-            <span className="text-[#8b949e] truncate max-w-[300px] text-[11px]">{subagentDesc}</span>
-          )}
 
           <span className="ml-auto flex-shrink-0 flex items-center gap-2">
-            {/* Tool count badge */}
             {toolCount > 0 && (
               <span className="text-[10px] text-[#667085] tabular-nums">
                 {toolCount} {toolCount === 1 ? 'tool' : 'tools'}
               </span>
             )}
-            {/* Progress summary */}
             {isRunning && block.subagentSummary && (
               <span className="text-[10px] text-[#667085] truncate max-w-[200px]" style={{ animation: 'chat-pulse 2s ease-in-out infinite' }}>
                 {block.subagentSummary}
               </span>
             )}
-            {isDone ? (
-              <CheckCircle2 size={13} className={block.subagentStatus === 'failed' ? 'text-[#ef4444]' : 'text-[#22C55E]'} />
-            ) : (
-              <TypingIndicatorMini accentColor={accentColor} />
-            )}
+            {isDone
+              ? <ToolStateBadge state={isFailed ? 'failed' : 'done'} accentColor={accentColor} />
+              : <ToolStateBadge state="running" accentColor={accentColor} />}
           </span>
         </button>
         {open && (
           <div className="border-t border-[#21262d] bg-[#0d1117]">
-            {/* Tool list */}
             <div className="max-h-80 overflow-y-auto">
               {subagentTools.length === 0 ? (
-                <div className="px-3 py-2 text-[11px] text-[#667085]">No tools yet</div>
+                <div className="px-3 py-2 text-[11px] text-[#667085]">No tool calls yet</div>
               ) : (
                 subagentTools.map((t, i) => {
-                  let inputPreview = ''
+                  let parsedToolInput: any = null
                   try {
-                    const parsed = JSON.parse(t.input)
-                    inputPreview = (parsed.command || parsed.file_path || parsed.path || parsed.pattern || parsed.description || t.input).slice(0, 60)
+                    parsedToolInput = JSON.parse(t.input)
                   } catch {
-                    inputPreview = t.input.slice(0, 60)
+                    parsedToolInput = null
                   }
+                  const inputPreview = summarizeToolInput(t.toolName, parsedToolInput, t.input).slice(0, 80)
                   return (
                     <div key={t.toolUseId || i} className="flex items-center gap-2 px-3 py-1.5 text-[11px] border-t border-[#21262d]/50 first:border-t-0">
-                      {getToolIcon(t.toolName)}
-                      <span className="text-[#8b949e] font-medium flex-shrink-0">{t.toolName}</span>
+                      {getToolIcon(t.toolName, accentColor, 11, 'text-[#667085] flex-shrink-0')}
+                      <span className="text-[#8b949e] font-medium flex-shrink-0">{getToolLabel(t.toolName)}</span>
                       {inputPreview && (
                         <span className="text-[#667085] truncate">{inputPreview}</span>
                       )}
@@ -1534,8 +1933,7 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
                 })
               )}
             </div>
-            {/* Collapsible raw input */}
-            {block.input && <AgentInputToggle parsedInput={parsedInput} rawInput={block.input} />}
+            {normalizedBlock.input && <AgentInputToggle parsedInput={parsedInput} rawInput={safeText(normalizedBlock.input)} />}
           </div>
         )}
       </div>
@@ -1543,7 +1941,7 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
   }
 
   // TodoWrite — pretty checklist renderer
-  if (block.toolName === 'TodoWrite' && Array.isArray(parsedInput?.todos)) {
+  if (normalizedBlock.toolName === 'TodoWrite' && Array.isArray(parsedInput?.todos)) {
     const todos: Array<{ content: string; status: string; priority?: string; id?: string }> = parsedInput.todos
     const completedCount = todos.filter(t => t.status === 'completed').length
 
@@ -1558,11 +1956,9 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
           <span className="font-medium text-[#e6edf3]">TodoWrite</span>
           <span className="text-[#667085] text-[11px]">{completedCount}/{todos.length} done</span>
           <span className="ml-auto flex-shrink-0">
-            {block.done ? (
-              <CheckCircle2 size={13} className="text-[#22C55E]" />
-            ) : (
-              <TypingIndicatorMini accentColor={accentColor} />
-            )}
+            {normalizedBlock.done
+              ? <ToolStateBadge state="done" accentColor={accentColor} />
+              : <ToolStateBadge state="running" accentColor={accentColor} />}
           </span>
         </button>
         <div className="px-3 py-2 border-t border-[#21262d] bg-[#0d1117] space-y-1">
@@ -1593,35 +1989,267 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
     )
   }
 
+  if (normalizedBlock.toolName === 'AskUserQuestion' && Array.isArray(parsedInput?.questions)) {
+    const questions: Array<{ question?: string; header?: string; options?: Array<{ label?: string; description?: string }>; multiSelect?: boolean }> = parsedInput.questions
+    const schemaPropertyKeys = (() => {
+      const schema = normalizedBlock.elicitationRequestedSchema as any
+      if (!schema || typeof schema !== 'object') return [] as string[]
+      if (!schema.properties || typeof schema.properties !== 'object') return [] as string[]
+      return Object.keys(schema.properties)
+    })()
+    const totalOptions = questions.reduce((acc, q) => acc + (Array.isArray(q.options) ? q.options.length : 0), 0)
+    const OTHER_SENTINEL = '__other__'
+    const hasSubmittedAsk = normalizedBlock.elicitationSubmitted || askFallbackSubmitted
+    const isAskLocked = hasSubmittedAsk || sendingAskAnswers
+    const allAnswered = questions.every((q, idx) => {
+      if (!q.question) return true
+      const selected = Array.isArray(askAnswers[idx]) ? askAnswers[idx] : []
+      if (selected.includes(OTHER_SENTINEL)) {
+        return (askOtherText[idx] || '').trim().length > 0
+      }
+      return selected.length > 0
+    })
+    const canSubmitStructured = !hasSubmittedAsk && !!onSubmitElicitation
+
+    const toggleAnswer = (questionIdx: number, optionLabel: string, multiSelect?: boolean) => {
+      setAskAnswers(prev => {
+        const current = prev[questionIdx] || []
+        if (!multiSelect) {
+          return { ...prev, [questionIdx]: [optionLabel] }
+        }
+        const next = current.includes(optionLabel)
+          ? current.filter(v => v !== optionLabel)
+          : [...current, optionLabel]
+        return { ...prev, [questionIdx]: next }
+      })
+    }
+
+    const submitAnswers = async () => {
+      const requestIdForSubmit = normalizedBlock.elicitationRequestId
+        || resolveFallbackElicitationRequestId?.()
+        || fallbackElicitationRequestId
+        || null
+      if (sendingAskAnswers || !allAnswered || isAskLocked) return
+      const content = questions.reduce<Record<string, unknown>>((acc, q: any, idx) => {
+        const selected = askAnswers[idx] || []
+        const otherText = (askOtherText[idx] || '').trim()
+        const selectedWithoutOther = selected.filter(v => v !== OTHER_SENTINEL)
+        const key = schemaPropertyKeys[idx]
+          || (typeof q?.id === 'string' && q.id.trim()
+          ? q.id.trim()
+          : (q.question || `question_${idx + 1}`))
+        if (q.multiSelect) {
+          acc[key] = otherText ? [...selectedWithoutOther, otherText] : selectedWithoutOther
+        } else {
+          acc[key] = otherText || selectedWithoutOther[0] || ''
+        }
+        return acc
+      }, {})
+      const fallbackPrompt = [
+        'Aqui estao minhas respostas para as perguntas estruturadas:',
+        ...questions.map((q: any, idx) => {
+          const selected = askAnswers[idx] || []
+          const otherText = (askOtherText[idx] || '').trim()
+          const selectedWithoutOther = selected.filter(v => v !== OTHER_SENTINEL)
+          const answer = q.multiSelect
+            ? (otherText ? [...selectedWithoutOther, otherText] : selectedWithoutOther).join(', ')
+            : (otherText || selectedWithoutOther[0] || '')
+          return `- ${q.question || `Question ${idx + 1}`}: ${answer}`
+        }),
+      ].join('\n')
+      try {
+        setSendingAskAnswers(true)
+        if (canSubmitStructured && requestIdForSubmit && onSubmitElicitation) {
+          const submitted = await onSubmitElicitation(requestIdForSubmit, content)
+          if (submitted) return
+        }
+        if (onSendPrompt) {
+          await onSendPrompt(fallbackPrompt)
+          setAskFallbackSubmitted(true)
+        }
+      } finally {
+        setSendingAskAnswers(false)
+      }
+    }
+
+    return (
+      <div className="relative z-10 border border-[#21262d] rounded-lg overflow-hidden pointer-events-auto">
+        <button
+          onClick={() => setOpen(!open)}
+          className="flex items-center gap-2 w-full px-3 py-2 text-[12px] bg-[#161b22] hover:bg-[#1c2333] transition-colors"
+        >
+          {open ? <ChevronDown size={12} className="text-[#667085]" /> : <ChevronRight size={12} className="text-[#667085]" />}
+          <ShieldAlert size={13} style={{ color: accentColor }} />
+          <span className="font-medium text-[#e6edf3]">AskUserQuestion</span>
+          <span className="text-[#667085] text-[11px]">
+            {questions.length} question{questions.length !== 1 ? 's' : ''}{totalOptions ? ` • ${totalOptions} options` : ''}
+          </span>
+          <span className="ml-auto flex-shrink-0">
+              {hasSubmittedAsk
+              ? <ToolStateBadge state="done" accentColor={accentColor} />
+              : <ToolStateBadge state="needs_input" accentColor={accentColor} />}
+          </span>
+        </button>
+        {open && (
+          <div className="relative z-10 px-3 py-3 border-t border-[#21262d] bg-[#0d1117] space-y-3 pointer-events-auto">
+            {questions.map((q, idx) => (
+              <div key={idx} className="rounded-lg border border-[#21262d] bg-[#11161d] p-3">
+                <div className="flex items-center gap-2 mb-2">
+                  {q.header && (
+                    <span className="text-[10px] uppercase tracking-wide rounded-full px-2 py-0.5 border border-[#2b3442] text-[#8b949e]">
+                      {q.header}
+                    </span>
+                  )}
+                </div>
+                <p className="text-[12px] text-[#e6edf3] font-medium mb-2">{q.question || `Question ${idx + 1}`}</p>
+                {Array.isArray(q.options) && q.options.length > 0 && (
+                  <div className="space-y-1.5">
+                    {q.options.map((opt, optIdx) => {
+                      const optionLabel = opt.label || `Option ${optIdx + 1}`
+                      const selected = (askAnswers[idx] || []).includes(optionLabel)
+                      return (
+                        <button
+                          key={optIdx}
+                          type="button"
+                          onClick={() => toggleAnswer(idx, optionLabel, q.multiSelect)}
+                          className="w-full text-left rounded-md border px-2.5 py-2 transition-colors"
+                          style={{
+                            borderColor: selected ? `${accentColor}66` : '#21262d',
+                            background: selected ? `${accentColor}12` : '#0d1117',
+                          }}
+                          disabled={isAskLocked}
+                        >
+                          <div className="text-[11px] text-[#e6edf3]">{optionLabel}</div>
+                          {opt.description && (
+                            <div className="text-[10px] text-[#667085] mt-0.5">{opt.description}</div>
+                          )}
+                        </button>
+                      )
+                    })}
+                    {(() => {
+                      const selected = (askAnswers[idx] || []).includes(OTHER_SENTINEL)
+                      return (
+                        <div className="rounded-md border px-2.5 py-2" style={{ borderColor: selected ? `${accentColor}66` : '#21262d', background: selected ? `${accentColor}12` : '#0d1117' }}>
+                          <button
+                            type="button"
+                            onClick={() => toggleAnswer(idx, OTHER_SENTINEL, q.multiSelect)}
+                            className="w-full text-left"
+                            disabled={isAskLocked}
+                          >
+                            <div className="text-[11px] text-[#e6edf3]">Other</div>
+                            <div className="text-[10px] text-[#667085] mt-0.5">Provide a custom text answer.</div>
+                          </button>
+                          {selected && (
+                            <input
+                              type="text"
+                              value={askOtherText[idx] || ''}
+                              onChange={(e) => setAskOtherText(prev => ({ ...prev, [idx]: e.target.value }))}
+                              placeholder="Type your answer"
+                              className="mt-2 w-full rounded-md border border-[#21262d] bg-[#11161d] px-2.5 py-2 text-[11px] text-[#e6edf3] placeholder:text-[#667085] outline-none"
+                              disabled={isAskLocked}
+                            />
+                          )}
+                        </div>
+                      )
+                    })()}
+                  </div>
+                )}
+              </div>
+            ))}
+            <div className="relative z-20 flex items-center justify-between gap-3 pt-2 pointer-events-auto">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (!allAnswered || isAskLocked) return
+                  void submitAnswers()
+                }}
+                disabled={!allAnswered || isAskLocked}
+                className="relative z-30 min-w-[96px] px-3 py-2 rounded-md text-[11px] font-medium pointer-events-auto disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{ background: `${accentColor}20`, color: accentColor, border: `1px solid ${accentColor}40` }}
+              >
+                {hasSubmittedAsk ? 'Done' : sendingAskAnswers ? 'Sending...' : 'Submit'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
   // Regular tool card
-  const displayInfo = parsedInput
-    ? (parsedInput.command || parsedInput.file_path || parsedInput.path || parsedInput.pattern || parsedInput.description || '')
-    : ''
+  const displayInfo = summarizeToolInput(normalizedBlock.toolName, parsedInput, safeText(normalizedBlock.input)).slice(0, 140)
+  const detailRows = getToolDetailRows(normalizedBlock.toolName, parsedInput)
+  const isFileTool = normalizedBlock.toolName === 'Read' || normalizedBlock.toolName === 'Write' || normalizedBlock.toolName === 'Edit'
+  const isTerminalTool = normalizedBlock.toolName === 'Bash'
 
   return (
     <div className="border border-[#21262d] rounded-lg overflow-hidden">
       <button
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-2 w-full px-3 py-2 text-[12px] bg-[#161b22] hover:bg-[#1c2333] transition-colors"
+        className="flex items-start gap-2 w-full px-3 py-2 text-[12px] bg-[#161b22] hover:bg-[#1c2333] transition-colors"
       >
-        {open ? <ChevronDown size={12} className="text-[#667085]" /> : <ChevronRight size={12} className="text-[#667085]" />}
-        <FileCode size={13} style={{ color: accentColor }} />
-        <span className="font-medium text-[#e6edf3]">{block.toolName}</span>
-        {displayInfo && (
-          <span className="text-[#667085] truncate max-w-[300px] text-[11px] font-mono">{displayInfo}</span>
-        )}
-        <span className="ml-auto flex-shrink-0">
-          {block.done ? (
-            <CheckCircle2 size={13} className="text-[#22C55E]" />
-          ) : (
-            <TypingIndicatorMini accentColor={accentColor} />
+        <span className="mt-0.5">
+          {open ? <ChevronDown size={12} className="text-[#667085]" /> : <ChevronRight size={12} className="text-[#667085]" />}
+        </span>
+        <span className="mt-0.5">
+          {getToolIcon(normalizedBlock.toolName, accentColor)}
+        </span>
+        <span className="min-w-0 flex-1 text-left">
+          <span className="flex items-center gap-2 flex-wrap">
+            <span className="font-medium text-[#e6edf3]">{getToolLabel(normalizedBlock.toolName)}</span>
+            {detailRows.chips.length > 0 && (
+              <span className="flex items-center gap-1 flex-wrap">
+                {detailRows.chips.map((chip, index) => (
+                  <span
+                    key={`${chip}-${index}`}
+                    className="rounded-full border px-1.5 py-0.5 text-[10px]"
+                    style={{
+                      borderColor: isTerminalTool ? `${accentColor}35` : isFileTool ? '#2b3442' : '#21262d',
+                      background: isTerminalTool ? `${accentColor}10` : '#0d1117',
+                      color: isTerminalTool ? accentColor : '#8b949e',
+                    }}
+                  >
+                    {chip}
+                  </span>
+                ))}
+              </span>
+            )}
+          </span>
+          {detailRows.primary && (
+            <span className={`block truncate max-w-[440px] text-[11px] mt-0.5 ${isFileTool || isTerminalTool ? 'font-mono' : ''}`} style={{ color: isFileTool ? '#c9d1d9' : '#8b949e' }}>
+              {detailRows.primary}
+            </span>
+          )}
+          {detailRows.secondary && (
+            <span className="block truncate max-w-[440px] text-[10px] mt-0.5 text-[#667085]">
+              {detailRows.secondary}
+            </span>
+          )}
+          {!detailRows.primary && displayInfo && (
+            <span className="block truncate max-w-[440px] text-[11px] mt-0.5 text-[#667085]">
+              {displayInfo}
+            </span>
           )}
         </span>
+        <span className="ml-auto flex-shrink-0 mt-0.5">
+          {normalizedBlock.done
+            ? <ToolStateBadge state="done" accentColor={accentColor} />
+            : <ToolStateBadge state="running" accentColor={accentColor} />}
+        </span>
       </button>
-      {open && block.input && (
+      {open && normalizedBlock.input && (
         <div className="px-3 py-2 border-t border-[#21262d] bg-[#0d1117]">
+          {(isFileTool || isTerminalTool) && detailRows.primary && (
+            <div className="mb-2 rounded-md border border-[#21262d] bg-[#11161d] px-2.5 py-2">
+              <div className="text-[11px] font-mono text-[#c9d1d9] break-all">
+                {detailRows.primary}
+              </div>
+            </div>
+          )}
           <pre className="text-[11px] text-[#8b949e] font-mono whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
-            {parsedInput ? JSON.stringify(parsedInput, null, 2) : block.input}
+            {parsedInput ? JSON.stringify(parsedInput, null, 2) : safeText(normalizedBlock.input)}
           </pre>
         </div>
       )}
@@ -1634,6 +2262,57 @@ interface ApprovalCardProps {
   accentColor: string
   onAllow: () => void
   onDeny: () => void
+}
+
+function summarizeApproval(req: PermissionRequest) {
+  const inp = req.input as any
+
+  if (req.toolName === 'Bash') {
+    const command = inp?.command ? String(inp.command).replace(/\s+/g, ' ').trim() : ''
+    return {
+      summary: command.slice(0, 140),
+      detail: req.description,
+    }
+  }
+
+  if (req.toolName === 'Write') {
+    const filePath = inp?.file_path ? String(inp.file_path) : ''
+    return {
+      summary: filePath,
+      detail: req.description,
+    }
+  }
+
+  if (req.toolName === 'Edit') {
+    const filePath = inp?.file_path ? String(inp.file_path) : ''
+    return {
+      summary: filePath,
+      detail: req.description,
+    }
+  }
+
+  if (req.toolName === 'Agent') {
+    const agentName = inp?.subagent_type || inp?.agent || ''
+    const prompt = inp?.prompt || inp?.description || ''
+    return {
+      summary: agentName ? `@${agentName}` : String(prompt).slice(0, 100),
+      detail: req.description,
+    }
+  }
+
+  if (req.toolName === 'AskUserQuestion') {
+    const questions = Array.isArray(inp?.questions) ? inp.questions : []
+    const firstQuestion = questions[0]?.question ? String(questions[0].question) : ''
+    return {
+      summary: questions.length > 0 ? `${questions.length} question${questions.length > 1 ? 's' : ''}` : '',
+      detail: firstQuestion || req.description,
+    }
+  }
+
+  return {
+    summary: req.title || '',
+    detail: req.description,
+  }
 }
 
 function ApprovalCard({ req, accentColor, onAllow, onDeny }: ApprovalCardProps) {
@@ -1652,6 +2331,7 @@ function ApprovalCard({ req, accentColor, onAllow, onDeny }: ApprovalCardProps) 
     summary = agentName ? `@${agentName}${prompt ? ' — ' + String(prompt).slice(0, 80) : ''}` : String(prompt).slice(0, 100)
   }
   if (!summary && req.title) summary = req.title
+  const { summary: friendlySummary, detail } = summarizeApproval(req)
 
   return (
     <div
@@ -1660,14 +2340,14 @@ function ApprovalCard({ req, accentColor, onAllow, onDeny }: ApprovalCardProps) 
     >
       <ShieldAlert size={14} className="flex-shrink-0 mt-0.5" style={{ color: '#F59E0B' }} />
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-0.5">
-          <span className="text-[11px] font-semibold text-[#e6edf3]">{req.toolName}</span>
-          {summary && (
-            <span className="text-[10px] text-[#8b949e] font-mono truncate max-w-[260px]">{summary}</span>
+        <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+          <span className="text-[11px] font-semibold text-[#e6edf3]">{getToolLabel(req.toolName)}</span>
+          {(friendlySummary || summary) && (
+            <span className="text-[10px] text-[#8b949e] truncate max-w-[320px]">{friendlySummary || summary}</span>
           )}
         </div>
-        {req.description && (
-          <p className="text-[10px] text-[#667085] truncate">{req.description}</p>
+        {(detail || req.description) && (
+          <p className="text-[10px] text-[#667085] line-clamp-2">{detail || req.description}</p>
         )}
       </div>
       <div className="flex items-center gap-1.5 flex-shrink-0">
@@ -1707,6 +2387,53 @@ function TypingIndicatorMini({ accentColor }: { accentColor: string }) {
           }}
         />
       ))}
+    </span>
+  )
+}
+
+function ToolStateBadge({
+  state,
+  accentColor,
+  label,
+}: {
+  state: 'running' | 'done' | 'needs_input' | 'failed'
+  accentColor: string
+  label?: string
+}) {
+  if (state === 'running') {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium"
+        style={{ color: accentColor, borderColor: `${accentColor}40`, background: `${accentColor}12` }}
+      >
+        <TypingIndicatorMini accentColor={accentColor} />
+        {label ? <span>{label}</span> : null}
+      </span>
+    )
+  }
+
+  if (state === 'needs_input') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium border-[#F59E0B40] bg-[#F59E0B12] text-[#F59E0B]">
+        <ShieldAlert size={10} />
+        {label ? <span>{label}</span> : null}
+      </span>
+    )
+  }
+
+  if (state === 'failed') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium border-[#ef444440] bg-[#ef444412] text-[#ef4444]">
+        <Ban size={10} />
+        <span>{label || 'Failed'}</span>
+      </span>
+    )
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium border-[#22C55E40] bg-[#22C55E12] text-[#22C55E]">
+      <CheckCircle2 size={10} />
+      {label ? <span>{label}</span> : null}
     </span>
   )
 }

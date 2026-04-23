@@ -3,7 +3,7 @@
 import json
 from datetime import date, timedelta
 from flask import Blueprint, jsonify, request
-from routes._helpers import WORKSPACE, safe_read
+from routes._helpers import WORKSPACE, safe_read, summarize_terminal_chat_usage
 from models import db, Heartbeat, HeartbeatRun
 from sqlalchemy import func
 
@@ -16,17 +16,17 @@ LOGS_DIR = WORKSPACE / "ADWs" / "logs"
 @bp.route("/api/costs")
 def costs_summary():
     content = safe_read(METRICS_PATH)
-    if not content:
-        return jsonify({"total_cost": 0, "by_routine": [], "by_agent": [], "today": 0, "week": 0, "month_estimate": 0})
-
+    data = {}
     try:
-        data = json.loads(content)
+        if content:
+            data = json.loads(content)
     except json.JSONDecodeError:
-        return jsonify({"total_cost": 0, "by_routine": [], "by_agent": [], "today": 0, "week": 0, "month_estimate": 0})
+        data = {}
 
     total = 0.0
     by_routine = []
     agent_costs = {}
+    chat_usage = summarize_terminal_chat_usage()
 
     if isinstance(data, dict):
         for name, val in data.items():
@@ -48,6 +48,10 @@ def costs_summary():
                     "agent": agent,
                 })
                 agent_costs[agent] = agent_costs.get(agent, 0.0) + cost
+
+    for chat_agent in chat_usage["by_agent"]:
+        agent = chat_agent["agent"]
+        agent_costs[agent] = agent_costs.get(agent, 0.0) + float(chat_agent.get("cost", 0) or 0)
 
     by_agent = [{"agent": a, "cost": round(c, 4)} for a, c in sorted(agent_costs.items(), key=lambda x: x[1], reverse=True)]
 
@@ -111,6 +115,13 @@ def costs_summary():
                 if ts >= week_start:
                     week_cost += cost_val
 
+    for day, cost_val in chat_usage["by_day"].items():
+        daily_costs[day] = daily_costs.get(day, 0.0) + cost_val
+        if day == today_str:
+            today_cost += cost_val
+        if day >= week_start:
+            week_cost += cost_val
+
     # Add heartbeat daily costs from DB
     hb_daily_rows = (
         db.session.query(
@@ -132,17 +143,24 @@ def costs_summary():
 
     daily = [{"date": k, "cost": round(v, 4)} for k, v in sorted(daily_costs.items())]
 
-    grand_total = total + hb_total
+    grand_total = total + hb_total + chat_usage["total_cost"]
     routine_runs_total = sum(r["runs"] for r in by_routine)
 
     return jsonify({
         "total_cost": round(grand_total, 4),
         "routines_total_cost": round(total, 4),
         "heartbeats_total_cost": round(hb_total, 4),
+        "chat_total_cost": round(chat_usage["total_cost"], 4),
+        "chat_total_tokens": chat_usage["total_tokens"],
+        "chat_input_tokens": chat_usage["input_tokens"],
+        "chat_output_tokens": chat_usage["output_tokens"],
+        "chat_cache_tokens": chat_usage["cache_tokens"],
+        "chat_requests": chat_usage["requests"],
+        "chat_sessions": chat_usage["sessions"],
         "today": round(today_cost, 4),
         "week": round(week_cost, 4),
         "month_estimate": round(grand_total, 4),
-        "total_runs": routine_runs_total + hb_runs_total,
+        "total_runs": routine_runs_total + hb_runs_total + chat_usage["requests"],
         "daily": daily,
         "by_routine": by_routine,
         "by_heartbeat": by_heartbeat,
@@ -154,6 +172,7 @@ def costs_summary():
 def costs_daily():
     from_date = request.args.get("from", (date.today() - timedelta(days=7)).isoformat())
     to_date = request.args.get("to", date.today().isoformat())
+    chat_usage = summarize_terminal_chat_usage()
 
     routines_daily = {}
     if LOGS_DIR.is_dir():
@@ -195,16 +214,23 @@ def costs_daily():
             heartbeats_daily[row.day] = float(row.cost or 0)
 
     # Merge all days
-    all_days = set(routines_daily.keys()) | set(heartbeats_daily.keys())
+    chat_daily = {
+        day: float(cost or 0)
+        for day, cost in chat_usage["by_day"].items()
+        if from_date <= day <= to_date
+    }
+    all_days = set(routines_daily.keys()) | set(heartbeats_daily.keys()) | set(chat_daily.keys())
     combined = []
     for day in sorted(all_days):
         r_cost = routines_daily.get(day, 0.0)
         h_cost = heartbeats_daily.get(day, 0.0)
+        c_cost = chat_daily.get(day, 0.0)
         combined.append({
             "date": day,
-            "cost": round(r_cost + h_cost, 4),
+            "cost": round(r_cost + h_cost + c_cost, 4),
             "routines_cost": round(r_cost, 4),
             "heartbeats_cost": round(h_cost, 4),
+            "chat_cost": round(c_cost, 4),
         })
 
     return jsonify(combined)

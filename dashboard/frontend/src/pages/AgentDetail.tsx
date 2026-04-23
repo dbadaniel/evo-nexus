@@ -26,6 +26,10 @@ const TS_HTTP = isLocal
   ? `http://${window.location.hostname}:32352`
   : `${window.location.origin}/terminal`
 
+function buildNativeSessionName(agentName: string) {
+  return `${agentName} — ${new Date().toLocaleString()}`
+}
+
 interface TerminalTab {
   id: string       // sessionId
   name: string     // display name
@@ -144,7 +148,7 @@ export default function AgentDetail() {
       const data = await res.json()
       const newTab: TerminalTab = {
         id: data.sessionId,
-        name: data.session?.name || `${name} #${termTabs.length + 1}`,
+        name: data.session?.name || buildNativeSessionName(name),
         active: false,
       }
       // If this is the first extra tab, we also need to load the existing default session
@@ -189,7 +193,8 @@ export default function AgentDetail() {
         if (prev && sessions.some(s => s.id === prev)) return prev
         return sessions.length > 0 ? sessions[0].id : null
       })
-    } catch {}
+    } catch {
+    }
   }, [name])
 
   useEffect(() => {
@@ -208,14 +213,37 @@ export default function AgentDetail() {
       const data = await res.json()
       const newSession: ChatSession = {
         id: data.sessionId,
-        name: data.session?.name || `${name} #${chatSessions.length + 1}`,
+        name: data.session?.name || buildNativeSessionName(name),
         active: false,
         ts: Date.now(),
       }
       setChatSessions(prev => [newSession, ...prev])
       setActiveChatSessionId(data.sessionId)
     } catch {}
-  }, [name, chatSessions])
+  }, [name])
+
+  const handleChatSessionCreated = useCallback((session: ChatSession) => {
+    setChatSessions(prev => {
+      if (prev.some(existing => existing.id === session.id)) {
+        return prev
+      }
+      return [session, ...prev]
+    })
+    setActiveChatSessionId(session.id)
+    setChatConnectError(null)
+    setChatConnecting(false)
+  }, [])
+
+  const handleChatSessionMetaChange = useCallback((sessionId: string, patch: Partial<ChatSession>) => {
+    setChatSessions(prev => {
+      const index = prev.findIndex(session => session.id === sessionId)
+      if (index < 0) return prev
+      const next = [...prev]
+      next[index] = { ...next[index], ...patch }
+      next.sort((a, b) => (b.ts || 0) - (a.ts || 0))
+      return next
+    })
+  }, [])
 
   const selectChatSession = useCallback((id: string) => {
     setActiveChatSessionId(id)
@@ -248,7 +276,9 @@ export default function AgentDetail() {
   const deleteChatSession = useCallback(async (id: string) => {
     try {
       await fetch(`${TS_HTTP}/api/sessions/${id}`, { method: 'DELETE' })
-      setChatSessions(prev => prev.filter(s => s.id !== id))
+      setChatSessions(prev => {
+        return prev.filter(s => s.id !== id)
+      })
       setActiveChatSessionId(prev => {
         if (prev !== id) return prev
         const remaining = chatSessions.filter(s => s.id !== id && !s.archived)
@@ -256,41 +286,6 @@ export default function AgentDetail() {
       })
     } catch {}
   }, [chatSessions])
-
-  // Auto-create a chat session when switching to chat mode if none exist
-  useEffect(() => {
-    if (viewMode === 'chat' && chatSessions.length === 0 && name) {
-      setChatConnectError(null)
-      setChatConnecting(true)
-      // Find-or-create via the for-agent endpoint
-      fetch(`${TS_HTTP}/api/sessions/for-agent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentName: name }),
-      })
-        .then(r => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`)
-          return r.json()
-        })
-        .then(data => {
-          if (!data) return
-          const session: ChatSession = {
-            id: data.sessionId,
-            name: data.session?.name || name,
-            active: data.session?.active ?? false,
-            ts: Date.now(),
-          }
-          setChatSessions([session])
-          setActiveChatSessionId(data.sessionId)
-        })
-        .catch(() => {
-          setChatConnectError(`Could not reach terminal-server at ${TS_HTTP}. Is it running?`)
-        })
-        .finally(() => {
-          setChatConnecting(false)
-        })
-    }
-  }, [viewMode, chatSessions.length, name])
 
   const closeTerminalTab = useCallback(async (sessionId: string) => {
     // Stop and delete session
@@ -383,6 +378,7 @@ export default function AgentDetail() {
 
   const profileBody = extractProfileBody(content)
   const profileLead = extractProfileLead(content)
+  const supportsPersistentMemory = !/no persistent agent memory/i.test(content)
 
   return (
     <div className="flex h-full w-full flex-col bg-[#0C111D]">
@@ -421,7 +417,9 @@ export default function AgentDetail() {
         {/* Memory count — right aligned */}
         <div className="ml-auto flex items-center gap-4">
           <span className="hidden sm:inline text-[10px] uppercase tracking-[0.12em] text-[#667085]">
-            {memories.length} {memories.length === 1 ? 'memory' : 'memories'}
+            {supportsPersistentMemory
+              ? `${memories.length} ${memories.length === 1 ? 'memory' : 'memories'}`
+              : 'no persistent memory'}
           </span>
 
           {/* Mobile drawer toggle */}
@@ -446,6 +444,7 @@ export default function AgentDetail() {
             profileLead={profileLead}
             profileBody={profileBody}
             memories={memories}
+            supportsPersistentMemory={supportsPersistentMemory}
             expandedMemory={expandedMemory}
             memoryContents={memoryContents}
             toggleMemory={toggleMemory}
@@ -490,6 +489,7 @@ export default function AgentDetail() {
                 profileLead={profileLead}
                 profileBody={profileBody}
                 memories={memories}
+                supportsPersistentMemory={supportsPersistentMemory}
                 expandedMemory={expandedMemory}
                 memoryContents={memoryContents}
                 toggleMemory={toggleMemory}
@@ -590,12 +590,14 @@ export default function AgentDetail() {
           <div className="relative z-10 flex-1 min-h-0">
             {viewMode === 'chat' ? (
               <AgentChat
-                key={`chat-${name}-${activeChatSessionId || 'default'}`}
+                key={`chat-${name}`}
                 agent={name}
                 sessionId={activeChatSessionId || undefined}
                 accentColor={agentColor}
                 externalLoading={chatConnecting}
                 externalError={chatConnectError}
+                onSessionCreated={handleChatSessionCreated}
+                onSessionMetaChange={handleChatSessionMetaChange}
                 onPendingCountChange={handlePendingCountChange}
                 onNeedsAttention={handleNeedsAttention}
               />
@@ -622,6 +624,7 @@ interface InfoRailProps {
   profileLead: string | null
   profileBody: string
   memories: MemoryFile[]
+  supportsPersistentMemory: boolean
   expandedMemory: string | null
   memoryContents: Record<string, string>
   toggleMemory: (name: string) => void
@@ -643,6 +646,7 @@ function InfoRail({
   profileLead,
   profileBody,
   memories,
+  supportsPersistentMemory,
   expandedMemory,
   memoryContents,
   toggleMemory,
@@ -673,7 +677,7 @@ function InfoRail({
           active={tab === 'memory'}
           onClick={() => setTab('memory')}
           color={agentColor}
-          count={memories.length}
+          count={supportsPersistentMemory ? memories.length : 0}
         />
       </div>
 
@@ -715,7 +719,14 @@ function InfoRail({
 
         {tab === 'memory' && (
           <div className="px-5 py-4">
-            {memories.length === 0 ? (
+            {!supportsPersistentMemory ? (
+              <div className="text-[12px] text-[#667085]">
+                <p className="mb-1">Este agente não mantém memória persistente.</p>
+                <p className="text-[11px] text-[#3F3F46]">
+                  O comportamento segue o prompt original do agente.
+                </p>
+              </div>
+            ) : memories.length === 0 ? (
               <div className="text-[12px] text-[#667085]">
                 <p className="mb-1">Sem memórias ainda.</p>
                 <p className="text-[11px] text-[#3F3F46]">

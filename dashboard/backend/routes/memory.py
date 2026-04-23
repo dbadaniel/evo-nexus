@@ -1,7 +1,13 @@
 """Memory endpoint — global and per-agent memory files."""
 
 from flask import Blueprint, jsonify, abort, Response
-from routes._helpers import WORKSPACE, safe_read, file_info
+from routes._helpers import (
+    WORKSPACE,
+    safe_read,
+    file_info,
+    agent_supports_persistent_memory,
+    count_agent_memory_entries,
+)
 
 bp = Blueprint("memory", __name__)
 
@@ -22,8 +28,10 @@ def memory_index():
     agent_counts = {}
     if AGENT_MEMORY_DIR.is_dir():
         for d in sorted(AGENT_MEMORY_DIR.iterdir()):
-            if d.is_dir():
-                count = sum(1 for f in d.iterdir() if f.is_file())
+            if d.is_dir() and agent_supports_persistent_memory(d.name):
+                count = count_agent_memory_entries(d.name)
+                if count <= 0:
+                    continue
                 agent_counts[d.name] = count
 
     return jsonify({
@@ -66,11 +74,14 @@ def get_memory_file(filepath):
 
 @bp.route("/api/memory/agents/<name>")
 def list_agent_memories(name):
+    if not agent_supports_persistent_memory(name):
+        return jsonify([])
+
     mem_dir = AGENT_MEMORY_DIR / name
     if not mem_dir.is_dir():
         return jsonify([])
     files = []
     for f in sorted(mem_dir.iterdir()):
-        if f.is_file():
+        if f.is_file() and f.name != "_improvements.md":
             files.append(file_info(f, mem_dir))
     return jsonify(files)

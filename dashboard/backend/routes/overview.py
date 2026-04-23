@@ -3,7 +3,7 @@
 import json
 from datetime import datetime
 from flask import Blueprint, jsonify
-from routes._helpers import WORKSPACE, safe_read
+from routes._helpers import WORKSPACE, safe_read, summarize_terminal_chat_usage
 
 bp = Blueprint("overview", __name__)
 
@@ -72,13 +72,21 @@ def _build_overview_metrics(raw_metrics: dict, integration_count: int) -> list[d
     total_cost = sum(v.get("total_cost_usd", 0) for v in raw_metrics.values())
     total_success = sum(v.get("successes", 0) for v in raw_metrics.values())
     success_rate = round((total_success / total_runs * 100), 1) if total_runs > 0 else 0
+    chat_usage = summarize_terminal_chat_usage()
+    combined_cost = total_cost + chat_usage["total_cost"]
+    combined_runs = total_runs + chat_usage["requests"]
 
     agents_count = len(list((WORKSPACE / ".claude" / "agents").glob("*.md"))) if (WORKSPACE / ".claude" / "agents").is_dir() else 0
     skills_count = len([d for d in (WORKSPACE / ".claude" / "skills").iterdir() if d.is_dir()]) if (WORKSPACE / ".claude" / "skills").is_dir() else 0
 
     return [
         {"label": "Routines Executed", "value": total_runs, "delta": f"{success_rate}% success", "deltaType": "up" if success_rate >= 90 else "neutral"},
-        {"label": "Total Cost", "value": f"${total_cost:.2f}", "delta": f"${total_cost / max(total_runs, 1):.2f}/run", "deltaType": "neutral"},
+        {
+            "label": "Total Cost",
+            "value": f"${combined_cost:.2f}",
+            "delta": f"chat ${chat_usage['total_cost']:.2f} • ${combined_cost / max(combined_runs, 1):.2f}/run",
+            "deltaType": "neutral",
+        },
         {"label": "Agents", "value": agents_count, "delta": f"{skills_count} skills", "deltaType": "neutral"},
         {"label": "Active Integrations", "value": integration_count},
     ]

@@ -2,12 +2,18 @@ const API = import.meta.env.DEV ? 'http://localhost:8080' : '';
 
 export const api = {
   get: async (path: string) => {
-    const res = await fetch(`${API}/api${path}`, { credentials: 'include' });
+    const res = await fetch(`${API}/api${path}`, {
+      credentials: 'include',
+      cache: 'no-store',
+    });
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     return res.json();
   },
   getRaw: async (path: string) => {
-    const res = await fetch(`${API}/api${path}`, { credentials: 'include' });
+    const res = await fetch(`${API}/api${path}`, {
+      credentials: 'include',
+      cache: 'no-store',
+    });
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     return res.text();
   },

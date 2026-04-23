@@ -2,11 +2,57 @@ const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
 
+const WORKSPACE_ROOT = path.resolve(__dirname, '..', '..', '..', '..');
+
+function sanitizeFiles(files) {
+    if (!Array.isArray(files)) {
+        return { files: undefined, hadLegacyPayload: false };
+    }
+
+    let hadLegacyPayload = false;
+    const sanitized = files.map((file) => {
+        if (file && (file.base64 || file.path)) {
+            hadLegacyPayload = true;
+        }
+        return {
+            name: file?.name,
+            type: file?.type,
+            previewUrl: file?.previewUrl,
+        };
+    });
+
+    return { files: sanitized, hadLegacyPayload };
+}
+
+function sanitizeChatHistory(chatHistory, sessionId) {
+    let hadLegacyPayload = false;
+    const sanitized = (chatHistory || []).map((msg, i) => {
+        const fileInfo = sanitizeFiles(msg?.files);
+        if (fileInfo.hadLegacyPayload) {
+            hadLegacyPayload = true;
+        }
+
+        const normalized = {
+            ...msg,
+            files: fileInfo.files,
+        };
+        if (!normalized.uuid) {
+            normalized.uuid = `legacy-${sessionId}-${i}`;
+        }
+        return normalized;
+    });
+
+    return { chatHistory: sanitized, hadLegacyPayload };
+}
+
 class SessionStore {
     constructor() {
-        // Store sessions in user's home directory
-        this.storageDir = path.join(os.homedir(), '.claude-code-web');
+        // Prefer a workspace-shared location so backend + terminal-server
+        // running in different environments still see the same persisted chat usage.
+        this.storageDir = path.join(WORKSPACE_ROOT, '.claude-code-web');
         this.sessionsFile = path.join(this.storageDir, 'sessions.json');
+        this.legacyStorageDir = path.join(os.homedir(), '.claude-code-web');
+        this.legacySessionsFile = path.join(this.legacyStorageDir, 'sessions.json');
         this.initializeStorage();
     }
 
@@ -14,18 +60,26 @@ class SessionStore {
         try {
             // Create storage directory if it doesn't exist
             await fs.mkdir(this.storageDir, { recursive: true });
+            await fs.mkdir(this.legacyStorageDir, { recursive: true });
         } catch (error) {
             console.error('Failed to create storage directory:', error);
         }
     }
 
     async saveSessions(sessions) {
+        let tempFile = null;
         try {
             // Ensure storage directory exists
             await fs.mkdir(this.storageDir, { recursive: true });
+            await fs.mkdir(this.legacyStorageDir, { recursive: true });
             
             // Convert Map to array for JSON serialization
-            const sessionsArray = Array.from(sessions.entries()).map(([id, session]) => ({
+            const sessionsArray = Array.from(sessions.entries()).map(([id, session]) => {
+                const sanitizedHistory = sanitizeChatHistory(
+                    Array.isArray(session.chatHistory) ? session.chatHistory.slice(-50) : [],
+                    id
+                );
+                return {
                 id,
                 name: session.name || 'Unnamed Session',
                 created: session.created || new Date(),
@@ -38,7 +92,7 @@ class SessionStore {
                 lastAccessed: session.lastAccessed || Date.now(),
                 // Chat mode data
                 mode: session.mode || null,
-                chatHistory: Array.isArray(session.chatHistory) ? session.chatHistory.slice(-50) : [], // Keep last 50 messages
+                chatHistory: sanitizedHistory.chatHistory, // Keep last 50 messages
                 sdkSessionId: session.sdkSessionId || null,
                 // Ticket binding (Feature 1.3)
                 ticketId: session.ticketId || null,
@@ -54,7 +108,8 @@ class SessionStore {
                     totalCost: 0,
                     models: {}
                 }
-            }));
+            };
+            });
 
             const data = {
                 version: '1.0',
@@ -63,15 +118,23 @@ class SessionStore {
             };
 
             // Write to a temporary file first, then rename (atomic operation)
-            const tempFile = `${this.sessionsFile}.tmp`;
+            tempFile = `${this.sessionsFile}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
             await fs.writeFile(tempFile, JSON.stringify(data, null, 2));
             // Ensure directory still exists before rename (handles race conditions)
             await fs.mkdir(this.storageDir, { recursive: true });
             await fs.rename(tempFile, this.sessionsFile);
+            await fs.writeFile(this.legacySessionsFile, JSON.stringify(data, null, 2));
             
             return true;
         } catch (error) {
             console.error('Failed to save sessions:', error.message);
+            if (tempFile) {
+                try {
+                    await fs.unlink(tempFile);
+                } catch {
+                    // Ignore temp cleanup errors
+                }
+            }
             return false;
         }
     }
@@ -79,9 +142,15 @@ class SessionStore {
     async loadSessions() {
         try {
             // Check if sessions file exists
-            await fs.access(this.sessionsFile);
+            let sourceFile = this.sessionsFile;
+            try {
+                await fs.access(sourceFile);
+            } catch {
+                sourceFile = this.legacySessionsFile;
+                await fs.access(sourceFile);
+            }
             
-            const data = await fs.readFile(this.sessionsFile, 'utf8');
+            const data = await fs.readFile(sourceFile, 'utf8');
             
             // Check if file is empty or just whitespace
             if (!data || !data.trim()) {
@@ -126,13 +195,7 @@ class SessionStore {
             for (const session of parsed.sessions) {
                 if (!session || !session.id) continue; // Skip invalid sessions
                 
-                // Synthesize uuids for legacy chatHistory entries that lack them
-                const chatHistory = (session.chatHistory || []).map((msg, i) => {
-                    if (!msg.uuid) {
-                        return { ...msg, uuid: `legacy-${session.id}-${i}` };
-                    }
-                    return msg;
-                });
+                const sanitizedHistory = sanitizeChatHistory(session.chatHistory || [], session.id);
 
                 // Restore session with default values for runtime properties
                 sessions.set(session.id, {
@@ -144,11 +207,18 @@ class SessionStore {
                     outputBuffer: session.outputBuffer || [],
                     maxBufferSize: 1000,
                     // Restore chat data
-                    chatHistory,
-                    sdkSessionId: session.sdkSessionId || null,
+                    chatHistory: sanitizedHistory.chatHistory,
+                    sdkSessionId: sanitizedHistory.hadLegacyPayload ? null : (session.sdkSessionId || null),
                     mode: session.mode || null,
                     // Restore usage data if available
-                    usageData: session.usageData || null
+                    sessionUsage: session.sessionUsage || {
+                        requests: 0,
+                        inputTokens: 0,
+                        outputTokens: 0,
+                        cacheTokens: 0,
+                        totalCost: 0,
+                        models: {}
+                    }
                 });
             }
 

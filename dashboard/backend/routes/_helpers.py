@@ -1,5 +1,6 @@
 """Shared helpers for route modules."""
 
+import json
 import re
 from pathlib import Path
 
@@ -40,6 +41,136 @@ def file_info(path: Path, base: Path | None = None) -> dict:
     except Exception:
         pass
     return info
+
+
+def load_terminal_chat_sessions() -> list[dict]:
+    """Load persisted terminal-server chat sessions, if available."""
+    candidate_paths = [
+        WORKSPACE / ".claude-code-web" / "sessions.json",
+        Path.home() / ".claude-code-web" / "sessions.json",
+    ]
+    for sessions_file in candidate_paths:
+        content = safe_read(sessions_file)
+        if not content:
+            continue
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        sessions = data.get("sessions")
+        if isinstance(sessions, list):
+            return sessions
+    return []
+
+
+def summarize_terminal_chat_usage() -> dict:
+    """Aggregate chat usage/cost metrics from terminal-server persisted sessions."""
+    total_cost = 0.0
+    total_requests = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cache_tokens = 0
+    total_sessions = 0
+    by_agent = {}
+    by_day = {}
+
+    for session in load_terminal_chat_sessions():
+        usage = session.get("sessionUsage") or {}
+        cost = float(usage.get("totalCost", 0) or 0)
+        requests = int(usage.get("requests", 0) or 0)
+        input_tokens = int(usage.get("inputTokens", 0) or 0)
+        output_tokens = int(usage.get("outputTokens", 0) or 0)
+        cache_tokens = int(usage.get("cacheTokens", 0) or 0)
+        agent = session.get("agentName") or "chat"
+        created = str(session.get("created") or "")[:10]
+
+        if cost <= 0 and requests <= 0 and input_tokens <= 0 and output_tokens <= 0 and cache_tokens <= 0:
+            continue
+
+        total_sessions += 1
+        total_cost += cost
+        total_requests += requests
+        total_input_tokens += input_tokens
+        total_output_tokens += output_tokens
+        total_cache_tokens += cache_tokens
+
+        if agent not in by_agent:
+            by_agent[agent] = {
+                "agent": agent,
+                "cost": 0.0,
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_tokens": 0,
+                "sessions": 0,
+            }
+
+        by_agent[agent]["cost"] += cost
+        by_agent[agent]["requests"] += requests
+        by_agent[agent]["input_tokens"] += input_tokens
+        by_agent[agent]["output_tokens"] += output_tokens
+        by_agent[agent]["cache_tokens"] += cache_tokens
+        by_agent[agent]["sessions"] += 1
+
+        if created:
+            by_day[created] = by_day.get(created, 0.0) + cost
+
+    return {
+        "total_cost": round(total_cost, 4),
+        "requests": total_requests,
+        "input_tokens": total_input_tokens,
+        "output_tokens": total_output_tokens,
+        "cache_tokens": total_cache_tokens,
+        "total_tokens": total_input_tokens + total_output_tokens,
+        "sessions": total_sessions,
+        "by_agent": sorted(by_agent.values(), key=lambda item: item["cost"], reverse=True),
+        "by_day": by_day,
+    }
+
+
+def agent_supports_persistent_memory(agent_name: str) -> bool:
+    """Infer whether an agent is documented as having persistent memory."""
+    agent_path = WORKSPACE / ".claude" / "agents" / f"{agent_name}.md"
+    content = safe_read(agent_path)
+    if not content:
+        return False
+
+    lowered = content.lower()
+    if "no persistent agent memory" in lowered:
+        return False
+
+    return (
+        ".claude/agent-memory/" in content
+        or "always read your memory folder first" in lowered
+        or "persistent, file-based memory system" in lowered
+        or "## memory" in lowered
+    )
+
+
+def count_agent_memory_entries(agent_name: str) -> int:
+    """Count effective memory entries for an agent, respecting MEMORY.md semantics."""
+    if not agent_supports_persistent_memory(agent_name):
+        return 0
+
+    mem_dir = WORKSPACE / ".claude" / "agent-memory" / agent_name
+    if not mem_dir.is_dir():
+        return 0
+
+    memory_index = mem_dir / "MEMORY.md"
+    content = safe_read(memory_index)
+    if content:
+        lines = [
+            line.strip()
+            for line in content.splitlines()
+            if line.strip().startswith("- ")
+        ]
+        return len(lines)
+
+    fallback_files = [
+        f for f in mem_dir.iterdir()
+        if f.is_file() and f.name not in {"MEMORY.md", "_improvements.md"}
+    ]
+    return len(fallback_files)
 
 
 # ── Dynamic routine discovery ─────────────────────────

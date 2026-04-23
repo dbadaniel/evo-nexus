@@ -96,6 +96,7 @@ interface Agent {
   name: string
   description: string
   memory_count: number
+  supports_memory?: boolean
   custom?: boolean
   color?: string
   model?: string
@@ -652,8 +653,7 @@ export default function Agents() {
   // Poll active agents every 5 seconds
   useEffect(() => {
     const fetchActive = () => {
-      fetch('/api/agents/active')
-        .then((r) => r.json())
+      api.get('/agents/active')
         .then((data) => {
           const names = (data.active_agents || []).map((a: { agent: string }) => a.agent)
           setRunningAgents(names)
@@ -666,7 +666,13 @@ export default function Agents() {
   }, [])
 
   const totalMemories = agents.reduce((sum, a) => sum + a.memory_count, 0)
-  const activeCount = agents.filter((a) => a.memory_count > 0).length
+  const activeCount = useMemo(() => {
+    return new Set(
+      runningAgents
+        .map((name) => String(name || '').trim())
+        .filter(Boolean)
+    ).size
+  }, [runningAgents])
 
   const counts = useMemo(() => {
     const c = { all: agents.length, business: 0, engineering: 0, custom: 0 }

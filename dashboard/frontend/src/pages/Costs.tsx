@@ -13,6 +13,13 @@ interface CostData {
   total_cost: number
   routines_total_cost: number
   heartbeats_total_cost: number
+  chat_total_cost: number
+  chat_total_tokens: number
+  chat_input_tokens: number
+  chat_output_tokens: number
+  chat_cache_tokens: number
+  chat_requests: number
+  chat_sessions: number
   total_runs: number
   daily: { date: string; cost: number }[]
   by_agent: { agent: string; cost: number }[]
@@ -61,6 +68,13 @@ function normalizeCostData(raw: any): CostData {
     total_cost: totalCost,
     routines_total_cost: Number(raw?.routines_total_cost || 0),
     heartbeats_total_cost: Number(raw?.heartbeats_total_cost || 0),
+    chat_total_cost: Number(raw?.chat_total_cost || 0),
+    chat_total_tokens: Number(raw?.chat_total_tokens || 0),
+    chat_input_tokens: Number(raw?.chat_input_tokens || 0),
+    chat_output_tokens: Number(raw?.chat_output_tokens || 0),
+    chat_cache_tokens: Number(raw?.chat_cache_tokens || 0),
+    chat_requests: Number(raw?.chat_requests || 0),
+    chat_sessions: Number(raw?.chat_sessions || 0),
     total_runs: Number(raw?.total_runs || 0),
     daily: Array.isArray(raw?.daily) ? raw.daily : [],
     by_agent: byAgent,
@@ -171,7 +185,8 @@ export default function Costs() {
           <h1 className="text-2xl font-bold text-[#e6edf3] tracking-tight">Costs</h1>
           <p className="text-[#667085] text-sm mt-1">AI usage cost analysis</p>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+          <SkeletonCard />
           <SkeletonCard />
           <SkeletonCard />
           <SkeletonCard />
@@ -211,7 +226,7 @@ export default function Costs() {
       </div>
 
       {/* KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
         <StatCard
           label="Today"
           value={`$${Number(data.today || 0).toFixed(2)}`}
@@ -227,7 +242,7 @@ export default function Costs() {
         <StatCard
           label="Total (All)"
           value={`$${grandTotal.toFixed(2)}`}
-          subtitle={imageTotalCost > 0 ? `Routines + Heartbeats + ${imageCosts?.totals?.count || 0} images` : 'Routines + Heartbeats'}
+          subtitle={imageTotalCost > 0 ? `Routines + Heartbeats + Chat + ${imageCosts?.totals?.count || 0} images` : 'Routines + Heartbeats + Chat'}
           icon={Zap}
         />
         <StatCard
@@ -235,6 +250,12 @@ export default function Costs() {
           value={`$${avgCostPerRun.toFixed(4)}`}
           subtitle={`${totalRuns} total runs`}
           icon={Calculator}
+        />
+        <StatCard
+          label="Chat Tokens"
+          value={data.chat_total_tokens.toLocaleString()}
+          subtitle={`${data.chat_requests} requests • $${data.chat_total_cost.toFixed(4)}`}
+          icon={Activity}
         />
       </div>
 
@@ -252,7 +273,7 @@ export default function Costs() {
             <LineChart data={data.daily}>
               <CartesianGrid strokeDasharray="3 3" stroke="#21262d" />
               <XAxis dataKey="date" tick={{ fill: '#667085', fontSize: 11 }} />
-              <YAxis tick={{ fill: '#667085', fontSize: 11 }} tickFormatter={(v) => `$${v.toFixed(2)}`} />
+              <YAxis tick={{ fill: '#667085', fontSize: 11 }} tickFormatter={(v: number) => `$${v.toFixed(2)}`} />
               <Tooltip
                 contentStyle={{ background: '#161b22', border: '1px solid #21262d', borderRadius: '12px', color: '#e6edf3' }}
                 formatter={(value: unknown) => [`$${Number(value).toFixed(4)}`, 'Cost']}

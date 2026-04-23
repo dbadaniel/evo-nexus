@@ -17,6 +17,37 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+function sanitizeFiles(files) {
+  if (!Array.isArray(files)) {
+    return { files: undefined, hadLegacyPayload: false };
+  }
+
+  let hadLegacyPayload = false;
+  const sanitized = files.map((file) => {
+    if (file && (file.base64 || file.path)) {
+      hadLegacyPayload = true;
+    }
+    return {
+      name: file?.name,
+      type: file?.type,
+      previewUrl: file?.previewUrl,
+    };
+  });
+
+  return { files: sanitized, hadLegacyPayload };
+}
+
+function sanitizeMessage(message) {
+  const fileInfo = sanitizeFiles(message?.files);
+  return {
+    message: {
+      ...message,
+      files: fileInfo.files,
+    },
+    hadLegacyPayload: fileInfo.hadLegacyPayload,
+  };
+}
+
 class ChatLogger {
   constructor(workspaceRoot) {
     this.logsDir = path.join(workspaceRoot || process.cwd(), 'workspace', 'ADWs', 'logs', 'chat');
@@ -42,13 +73,15 @@ class ChatLogger {
    */
   append(agentName, sessionId, message) {
     try {
-      if (!message.uuid) {
-        message.uuid = crypto.randomUUID();
+      const sanitized = sanitizeMessage(message);
+      const entry = sanitized.message;
+      if (!entry.uuid) {
+        entry.uuid = crypto.randomUUID();
       }
       const logPath = this._logPath(agentName, sessionId);
-      const line = JSON.stringify(message) + '\n';
+      const line = JSON.stringify(entry) + '\n';
       fs.appendFileSync(logPath, line, 'utf8');
-      return message.uuid;
+      return entry.uuid;
     } catch (err) {
       console.error(`[chat-logger] Failed to append: ${err.message}`);
       return null;
@@ -106,6 +139,7 @@ class ChatLogger {
 
       // Second pass: play forward, applying rewind markers
       const messages = [];
+      let hadLegacyPayload = false;
       for (const entry of rawLines) {
         if (entry.type === 'rewind') {
           // Drop the message with entry.at uuid AND everything after it
@@ -115,10 +149,15 @@ class ChatLogger {
           }
           // If uuid not found (e.g. marker for already-rewound content), no-op
         } else {
-          messages.push(entry);
+          const sanitized = sanitizeMessage(entry);
+          if (sanitized.hadLegacyPayload) {
+            hadLegacyPayload = true;
+          }
+          messages.push(sanitized.message);
         }
       }
 
+      messages.hadLegacyAttachmentPayload = hadLegacyPayload;
       return messages;
     } catch (err) {
       console.error(`[chat-logger] Failed to read: ${err.message}`);

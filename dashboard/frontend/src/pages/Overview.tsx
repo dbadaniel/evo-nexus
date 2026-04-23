@@ -45,6 +45,15 @@ interface ActiveAgent {
   status?: string
 }
 
+interface ActiveAgentsResponse {
+  active_agents?: Array<{
+    agent?: string
+    source?: string
+    started_at?: string
+    last_activity?: string
+  }>
+}
+
 // --- Area color mapping for report badges ---
 const AREA_COLORS: Record<string, { bg: string; text: string; border: string }> = {
   'Operations': { bg: 'rgba(34,211,238,0.10)', text: '#22D3EE', border: 'rgba(34,211,238,0.25)' },
@@ -216,17 +225,39 @@ export default function Overview() {
   const [activeAgents, setActiveAgents] = useState<ActiveAgent[]>([])
   const [agentsLoading, setAgentsLoading] = useState(true)
 
-  useEffect(() => {
+  const fetchOverview = useCallback(() => {
     api.get('/overview')
-      .then(setData)
+      .then((result) => {
+        setData(result)
+        setError(null)
+      })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
   }, [])
 
+  useEffect(() => {
+    fetchOverview()
+    const interval = setInterval(fetchOverview, 15000)
+    return () => clearInterval(interval)
+  }, [fetchOverview])
+
   const fetchActiveAgents = useCallback(() => {
     api.get('/agents/active')
-      .then((agents: ActiveAgent[]) => {
-        setActiveAgents(Array.isArray(agents) ? agents : [])
+      .then((payload: ActiveAgentsResponse | ActiveAgent[]) => {
+        const entries = Array.isArray(payload)
+          ? payload
+          : Array.isArray(payload?.active_agents)
+            ? payload.active_agents
+            : []
+
+        const normalized = entries
+          .map((entry: any) => ({
+            name: String(entry?.name || entry?.agent || '').trim(),
+            status: entry?.status,
+          }))
+          .filter((entry) => entry.name.length > 0)
+
+        setActiveAgents(normalized)
       })
       .catch(() => {
         setActiveAgents([])

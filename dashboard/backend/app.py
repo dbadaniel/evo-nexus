@@ -524,27 +524,62 @@ def api_version():
 
 @app.route("/api/agents/active")
 def api_agents_active():
-    """Return currently active agents from hook-generated status file."""
+    """Return currently active agents from hook status + terminal chat sessions."""
     import json
+    import requests as http_requests
     status_file = WORKSPACE / ".claude" / "agent-status.json"
+    active = []
+    seen = set()
+    last_updated = None
+
     try:
         if status_file.is_file():
             data = json.loads(status_file.read_text())
             # Filter entries older than 10 minutes (stale)
             from datetime import datetime, timezone, timedelta
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
-            active = []
             for entry in data.get("active_agents", []):
                 try:
                     started = datetime.fromisoformat(entry["started_at"].replace("Z", "+00:00"))
                     if started > cutoff:
-                        active.append(entry)
+                        key = (entry.get("agent"), entry.get("started_at"))
+                        if key not in seen:
+                            active.append(entry)
+                            seen.add(key)
                 except (KeyError, ValueError):
                     pass
-            return {"active_agents": active, "last_updated": data.get("last_updated")}
     except Exception:
         pass
-    return {"active_agents": [], "last_updated": None}
+    try:
+        resp = http_requests.get("http://localhost:32352/api/sessions/active", timeout=1.5)
+        if resp.status_code == 200:
+            data = resp.json()
+            for entry in data.get("active_sessions", []):
+                agent = entry.get("agent")
+                started_at = entry.get("startedAt")
+                if not agent:
+                    continue
+                key = (agent, started_at)
+                if key in seen:
+                    continue
+                active.append({
+                    "agent": agent,
+                    "session_id": entry.get("sessionId"),
+                    "source": "terminal_chat",
+                    "started_at": started_at,
+                    "last_activity": entry.get("lastActivity"),
+                })
+                seen.add(key)
+    except Exception:
+        pass
+
+    if status_file.is_file():
+        try:
+            data = json.loads(status_file.read_text())
+            last_updated = data.get("last_updated")
+        except Exception:
+            last_updated = None
+    return {"active_agents": active, "last_updated": last_updated}
 
 
 # --- Version check with 1h cache ---

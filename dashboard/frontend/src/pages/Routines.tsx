@@ -251,7 +251,7 @@ export default function Routines() {
               <BarChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#21262d" />
                 <XAxis dataKey="name" tick={{ fill: '#667085', fontSize: 11 }} angle={-30} textAnchor="end" height={60} />
-                <YAxis tick={{ fill: '#667085', fontSize: 11 }} tickFormatter={(v) => `$${v.toFixed(2)}`} />
+                <YAxis tick={{ fill: '#667085', fontSize: 11 }} tickFormatter={(v: number) => `$${v.toFixed(2)}`} />
                 <Tooltip
                   contentStyle={{ background: '#161b22', border: '1px solid #21262d', borderRadius: '12px', color: '#e6edf3' }}
                   formatter={(value: unknown) => [`$${Number(value).toFixed(4)}`, 'Cost']}

@@ -2,20 +2,20 @@
 
 from flask import Blueprint, jsonify, abort, Response
 from flask_login import login_required, current_user
-from routes._helpers import WORKSPACE, safe_read, parse_frontmatter, file_info
+from routes._helpers import (
+    WORKSPACE,
+    safe_read,
+    parse_frontmatter,
+    file_info,
+    agent_supports_persistent_memory,
+    count_agent_memory_entries,
+)
 from models import has_agent_access
 
 bp = Blueprint("agents", __name__)
 
 AGENTS_DIR = WORKSPACE / ".claude" / "agents"
 AGENT_MEMORY_DIR = WORKSPACE / ".claude" / "agent-memory"
-
-
-def _count_memory(name: str) -> int:
-    mem_dir = AGENT_MEMORY_DIR / name
-    if not mem_dir.is_dir():
-        return 0
-    return sum(1 for f in mem_dir.iterdir() if f.is_file())
 
 
 @bp.route("/api/agents")
@@ -30,10 +30,12 @@ def list_agents():
             content = safe_read(f) or ""
             fm = parse_frontmatter(content)
             name = f.stem
+            supports_memory = agent_supports_persistent_memory(name)
             entry = {
                 "name": name,
                 "description": fm.get("description", ""),
-                "memory_count": _count_memory(name),
+                "memory_count": count_agent_memory_entries(name),
+                "supports_memory": supports_memory,
                 "custom": name.startswith("custom-"),
                 "locked": not has_agent_access(role, name),
             }
@@ -59,6 +61,9 @@ def get_agent(name):
 
 @bp.route("/api/agents/<name>/memory")
 def list_agent_memory(name):
+    if not agent_supports_persistent_memory(name):
+        return jsonify([])
+
     mem_dir = (AGENT_MEMORY_DIR / name).resolve()
     try:
         mem_dir.relative_to(AGENT_MEMORY_DIR.resolve())
@@ -68,7 +73,7 @@ def list_agent_memory(name):
         return jsonify([])
     files = []
     for f in sorted(mem_dir.iterdir()):
-        if f.is_file():
+        if f.is_file() and f.name != "_improvements.md":
             files.append(file_info(f, mem_dir))
     return jsonify(files)
 

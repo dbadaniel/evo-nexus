@@ -9,6 +9,130 @@ const { ChatBridge } = require('./chat-bridge');
 const SessionStore = require('./utils/session-store');
 const ChatLogger = require('./utils/chat-logger');
 
+function toNumber(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
+}
+
+function sanitizeFilesForHistory(files) {
+  if (!Array.isArray(files)) return undefined;
+  return files.map((file) => ({
+    name: file?.name,
+    type: file?.type,
+    previewUrl: file?.previewUrl,
+  }));
+}
+
+function accumulateSessionUsage(session, result) {
+  if (!session) return;
+
+  if (!session.sessionUsage) {
+    session.sessionUsage = {
+      requests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheTokens: 0,
+      totalCost: 0,
+      models: {},
+    };
+  }
+
+  const usage = result?.usage || {};
+  const modelUsage = result?.modelUsage || usage.modelUsage || {};
+
+  session.sessionUsage.requests += 1;
+  session.sessionUsage.inputTokens += toNumber(usage.input_tokens || usage.inputTokens);
+  session.sessionUsage.outputTokens += toNumber(usage.output_tokens || usage.outputTokens);
+  session.sessionUsage.cacheTokens += toNumber(usage.cache_creation_input_tokens || 0)
+    + toNumber(usage.cache_read_input_tokens || 0)
+    + toNumber(usage.cacheTokens || 0);
+  session.sessionUsage.totalCost += toNumber(result?.totalCost);
+
+  for (const [modelName, stats] of Object.entries(modelUsage)) {
+    if (!session.sessionUsage.models[modelName]) {
+      session.sessionUsage.models[modelName] = {
+        requests: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        costUSD: 0,
+      };
+    }
+
+    const modelEntry = session.sessionUsage.models[modelName];
+    modelEntry.requests += 1;
+    modelEntry.inputTokens += toNumber(stats.inputTokens || stats.input_tokens);
+    modelEntry.outputTokens += toNumber(stats.outputTokens || stats.output_tokens);
+    modelEntry.cacheReadInputTokens += toNumber(stats.cacheReadInputTokens || stats.cache_read_input_tokens);
+    modelEntry.cacheCreationInputTokens += toNumber(stats.cacheCreationInputTokens || stats.cache_creation_input_tokens);
+    modelEntry.costUSD += toNumber(stats.costUSD || stats.cost_usd);
+  }
+}
+
+function buildChatSystemMessage(text) {
+  return {
+    role: 'system',
+    text,
+    ts: Date.now(),
+  };
+}
+
+function buildNativeSessionName(agentName, date = new Date()) {
+  return `${agentName} — ${date.toLocaleString()}`;
+}
+
+function cloneAssistantBlocks(blocks) {
+  if (!Array.isArray(blocks)) return [];
+  return blocks.map((block) => {
+    if (!block || typeof block !== 'object') return block;
+    return { ...block };
+  });
+}
+
+function upsertStreamingAssistantMessage(session, blocks) {
+  if (!session || !Array.isArray(session.chatHistory) || !Array.isArray(blocks) || blocks.length === 0) return;
+
+  const nextBlocks = cloneAssistantBlocks(blocks);
+  const last = session.chatHistory[session.chatHistory.length - 1];
+  if (last?.role === 'assistant' && last?.streaming) {
+    last.blocks = nextBlocks;
+    if (!last.ts) last.ts = Date.now();
+    return;
+  }
+
+  session.chatHistory.push({
+    role: 'assistant',
+    blocks: nextBlocks,
+    ts: Date.now(),
+    streaming: true,
+  });
+}
+
+function finalizeStreamingAssistantMessage(session, blocks) {
+  if (!session || !Array.isArray(session.chatHistory) || !Array.isArray(blocks) || blocks.length === 0) return null;
+
+  const assistantMsg = {
+    role: 'assistant',
+    blocks: cloneAssistantBlocks(blocks),
+    ts: Date.now(),
+    streaming: false,
+  };
+  const last = session.chatHistory[session.chatHistory.length - 1];
+  if (last?.role === 'assistant' && last?.streaming) {
+    session.chatHistory[session.chatHistory.length - 1] = {
+      ...last,
+      blocks: assistantMsg.blocks,
+      ts: assistantMsg.ts,
+      streaming: false,
+    };
+    return session.chatHistory[session.chatHistory.length - 1];
+  }
+
+  session.chatHistory.push(assistantMsg);
+  return assistantMsg;
+}
+
 class TerminalServer {
   constructor(options = {}) {
     this.port = options.port || 32352;
@@ -150,6 +274,7 @@ class TerminalServer {
         outputBuffer: [],
         maxBufferSize: 1000,
       };
+      session.name = buildNativeSessionName(agentName, session.created);
       this.claudeSessions.set(sessionId, session);
       this.saveSessionsToDisk();
 
@@ -207,6 +332,29 @@ class TerminalServer {
       res.json({ sessions });
     });
 
+    this.app.get('/api/sessions/active', (_req, res) => {
+      const activeSessions = [];
+      for (const [id, s] of this.claudeSessions.entries()) {
+        const bridgeActive = this.chatBridge.isActive(id);
+        const isChatSession = s.mode === 'chat';
+        const isActive = isChatSession ? bridgeActive : Boolean(s.active || bridgeActive);
+        if (isChatSession && s.active !== bridgeActive) {
+          s.active = bridgeActive;
+        }
+        if (!isActive || !s.agentName) continue;
+
+        activeSessions.push({
+          sessionId: id,
+          agent: s.agentName,
+          name: s.name,
+          mode: s.mode || null,
+          startedAt: s.sessionStartTime || s.created || null,
+          lastActivity: s.lastActivity || null,
+        });
+      }
+      res.json({ active_sessions: activeSessions });
+    });
+
     // Create a NEW session for an agent (always creates, never reuses)
     this.app.post('/api/sessions/create', (req, res) => {
       const { agentName, workingDir } = req.body;
@@ -243,6 +391,7 @@ class TerminalServer {
         outputBuffer: [],
         maxBufferSize: 1000,
       };
+      session.name = buildNativeSessionName(agentName, session.created);
       this.claudeSessions.set(sessionId, session);
       this.saveSessionsToDisk();
 
@@ -514,7 +663,7 @@ class TerminalServer {
             const userMsg = {
               role: 'user',
               text: data.prompt,
-              files: data.files || undefined,
+              files: sanitizeFilesForHistory(data.files),
               ts: Date.now(),
             };
             chatSession.chatHistory.push(userMsg);
@@ -568,6 +717,24 @@ class TerminalServer {
                     return;
                   }
 
+                  if (msg.type === 'elicitation_request') {
+                    this.broadcastToSession(wsInfo.claudeSessionId, {
+                      type: 'elicitation_request',
+                      sessionId: wsInfo.claudeSessionId,
+                      requestId: msg.requestId,
+                      mcpServerName: msg.mcpServerName || null,
+                      message: msg.message || '',
+                      mode: msg.mode || 'form',
+                      url: msg.url || null,
+                      elicitationId: msg.elicitationId || null,
+                      requestedSchema: msg.requestedSchema || null,
+                      title: msg.title || null,
+                      displayName: msg.displayName || null,
+                      description: msg.description || null,
+                    });
+                    return;
+                  }
+
                   // Auto-bind session to a ticket when the agent creates one.
                   // Only binds if not already bound — doesn't overwrite user's manual pick.
                   if (msg.type === 'ticket_detected' && msg.ticketId) {
@@ -582,46 +749,71 @@ class TerminalServer {
                     return;
                   }
 
+                  if (msg.type === 'result' && !msg.isError) {
+                    accumulateSessionUsage(chatSession, msg);
+                  }
+
                   // Build assistant blocks for history
-                  if (msg.type === 'text_start' || msg.type === 'message_start') {
-                    if (!isStreaming) {
-                      isStreaming = true;
-                      assistantBlocks = [];
-                    }
-                  }
-                  if (msg.type === 'text_delta') {
-                    const last = assistantBlocks[assistantBlocks.length - 1];
-                    if (last?.type === 'text') {
-                      last.text += msg.text || '';
-                    } else {
-                      assistantBlocks.push({ type: 'text', text: msg.text || '' });
-                    }
-                  }
-                  if (msg.type === 'tool_use_start') {
-                    assistantBlocks.push({
-                      type: 'tool_use',
-                      toolName: msg.toolName,
+	                  if (msg.type === 'text_start' || msg.type === 'message_start') {
+	                    if (!isStreaming) {
+	                      isStreaming = true;
+	                      assistantBlocks = [];
+	                    }
+	                    if (assistantBlocks.length > 0) {
+	                      upsertStreamingAssistantMessage(chatSession, assistantBlocks);
+	                    }
+	                  }
+	                  if (msg.type === 'text_delta') {
+	                    const last = assistantBlocks[assistantBlocks.length - 1];
+	                    if (last?.type === 'text') {
+	                      last.text += msg.text || '';
+	                    } else {
+	                      assistantBlocks.push({ type: 'text', text: msg.text || '' });
+	                    }
+	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
+	                  }
+	                  if (msg.type === 'tool_use_start') {
+	                    assistantBlocks.push({
+	                      type: 'tool_use',
+	                      toolName: msg.toolName,
                       toolId: msg.toolId,
-                      input: '',
-                      done: false,
-                    });
-                  }
-                  if (msg.type === 'tool_input_delta') {
-                    const last = assistantBlocks[assistantBlocks.length - 1];
-                    if (last?.type === 'tool_use') {
-                      last.input += msg.json || '';
-                    }
-                  }
-                  if (msg.type === 'block_stop') {
-                    const last = assistantBlocks[assistantBlocks.length - 1];
-                    if (last?.type === 'tool_use') last.done = true;
-                  }
+	                      input: '',
+	                      done: false,
+	                    });
+	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
+	                  }
+	                  if (msg.type === 'tool_input_delta') {
+	                    const last = assistantBlocks[assistantBlocks.length - 1];
+	                    if (last?.type === 'tool_use') {
+	                      last.input += msg.json || '';
+	                    }
+	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
+	                  }
+	                  if (msg.type === 'block_stop') {
+	                    const last = assistantBlocks[assistantBlocks.length - 1];
+	                    if (last?.type === 'tool_use') last.done = true;
+	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
+	                  }
+	                  if (msg.type === 'assistant_message' && Array.isArray(msg.blocks) && msg.blocks.length > 0) {
+	                    assistantBlocks = cloneAssistantBlocks(msg.blocks);
+	                    isStreaming = true;
+	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
+	                  }
 
                   // Also broadcast the current assistant blocks for live history
                   this.broadcastToSession(wsInfo.claudeSessionId, { type: 'chat_event', event: msg });
                 },
-                onError: (err) => {
-                  chatSession.active = false;
+	                onError: (err) => {
+	                  chatSession.active = false;
+	                  const last = chatSession.chatHistory[chatSession.chatHistory.length - 1];
+	                  if (last?.role === 'assistant' && last?.streaming) {
+	                    last.streaming = false;
+	                  }
+	                  this.persistChatSystemMessage(
+	                    wsInfo.claudeSessionId,
+	                    `Error: ${err.message || 'Unknown error'}`
+                  );
+                  this.saveSessionsToDisk();
                   this.broadcastToSession(wsInfo.claudeSessionId, {
                     type: 'chat_error',
                     message: err.message || 'Unknown error',
@@ -632,18 +824,14 @@ class TerminalServer {
                   // Store SDK session ID for future resume
                   if (info?.sdkSessionId) {
                     chatSession.sdkSessionId = info.sdkSessionId;
-                  }
-                  // Save assistant message to history
-                  if (assistantBlocks.length > 0) {
-                    const assistantMsg = {
-                      role: 'assistant',
-                      blocks: assistantBlocks,
-                      ts: Date.now(),
-                      streaming: false,
-                    };
-                    chatSession.chatHistory.push(assistantMsg);
-                    this.chatLogger.append(chatSession.agentName, wsInfo.claudeSessionId, assistantMsg);
-                  }
+	                  }
+	                  // Save assistant message to history
+	                  if (assistantBlocks.length > 0) {
+	                    const assistantMsg = finalizeStreamingAssistantMessage(chatSession, assistantBlocks);
+	                    if (assistantMsg) {
+	                      this.chatLogger.append(chatSession.agentName, wsInfo.claudeSessionId, assistantMsg);
+	                    }
+	                  }
                   this.saveSessionsToDisk();
                   this.broadcastToSession(wsInfo.claudeSessionId, { type: 'chat_complete' });
                   // Global notification — skip if a client is already watching this session
@@ -663,6 +851,11 @@ class TerminalServer {
             } catch (err) {
               console.error('[chat_send] Error starting chat session:', err);
               chatSession.active = false;
+              this.persistChatSystemMessage(
+                wsInfo.claudeSessionId,
+                `Error: ${err.message || String(err)}`
+              );
+              this.saveSessionsToDisk();
               this.sendToWebSocket(wsInfo.ws, { type: 'chat_error', message: err.message || String(err) });
             }
           }
@@ -680,6 +873,17 @@ class TerminalServer {
       case 'permission_response':
         if (wsInfo.claudeSessionId && data.requestId !== undefined) {
           this.chatBridge.respondToApproval(wsInfo.claudeSessionId, data.requestId, !!data.approved);
+        }
+        break;
+
+      case 'elicitation_response':
+        if (wsInfo.claudeSessionId && data.requestId !== undefined) {
+          this.chatBridge.respondToElicitation(
+            wsInfo.claudeSessionId,
+            data.requestId,
+            typeof data.action === 'string' ? data.action : 'accept',
+            data.content && typeof data.content === 'object' ? data.content : undefined,
+          );
         }
         break;
 
@@ -723,18 +927,31 @@ class TerminalServer {
 
     if (wsInfo.claudeSessionId) await this.leaveClaudeSession(wsId);
 
-    wsInfo.claudeSessionId = claudeSessionId;
-    session.connections.add(wsId);
-    session.lastActivity = new Date();
-    session.lastAccessed = Date.now();
+	    wsInfo.claudeSessionId = claudeSessionId;
+	    session.connections.add(wsId);
+	    session.lastActivity = new Date();
+	    session.lastAccessed = Date.now();
 
-    // Restore chat history from JSONL logs if session cache is empty
-    let chatHistory = session.chatHistory || [];
+	    // Reconcile stale UI state: a session can be marked active from a prior turn
+	    // even when the bridge no longer has a live process/query behind it.
+	    if (session.active && !this.chatBridge.isActive(claudeSessionId)) {
+	      session.active = false;
+	      const last = Array.isArray(session.chatHistory) ? session.chatHistory[session.chatHistory.length - 1] : null;
+	      if (last?.role === 'assistant' && last?.streaming) {
+	        last.streaming = false;
+	      }
+	    }
+
+	    // Restore chat history from JSONL logs if session cache is empty
+	    let chatHistory = session.chatHistory || [];
     if (chatHistory.length === 0 && session.agentName && session.mode === 'chat') {
       const restored = this.chatLogger.read(session.agentName, claudeSessionId);
       if (restored.length > 0) {
         session.chatHistory = restored;
         chatHistory = restored;
+        if (restored.hadLegacyAttachmentPayload) {
+          session.sdkSessionId = null;
+        }
         if (this.dev) console.log(`[chat-logger] Restored ${restored.length} messages for session ${claudeSessionId}`);
       }
     }
@@ -893,6 +1110,21 @@ class TerminalServer {
 
     this.globalSubscribers.delete(wsId);
     this.webSocketConnections.delete(wsId);
+  }
+
+  persistChatSystemMessage(sessionId, text) {
+    const session = this.claudeSessions.get(sessionId);
+    if (!session || !session.agentName) return;
+    if (!session.chatHistory) session.chatHistory = [];
+
+    const last = session.chatHistory[session.chatHistory.length - 1];
+    if (last?.role === 'system' && last?.text === text) {
+      return;
+    }
+
+    const systemMsg = buildChatSystemMessage(text);
+    session.chatHistory.push(systemMsg);
+    this.chatLogger.append(session.agentName, sessionId, systemMsg);
   }
 
   close() {
