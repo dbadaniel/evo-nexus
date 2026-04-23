@@ -1,0 +1,4571 @@
+From b86a55155703671dc55eb5b68ce95c458b203f33 Mon Sep 17 00:00:00 2001
+From: Daniel <dbadaniel@gmail.com>
+Date: Wed, 22 Apr 2026 22:44:54 -0300
+Subject: [PATCH] feat: update OpenClaude dashboard integration
+
+---
+ dashboard/backend/app.py                      |  45 +-
+ dashboard/backend/routes/_helpers.py          | 131 +++
+ dashboard/backend/routes/agents.py            |  25 +-
+ dashboard/backend/routes/costs.py             |  46 +-
+ dashboard/backend/routes/memory.py            |  19 +-
+ dashboard/backend/routes/overview.py          |  12 +-
+ dashboard/frontend/package-lock.json          |  40 +-
+ .../frontend/src/components/AgentChat.tsx     | 985 +++++++++++++++---
+ dashboard/frontend/src/lib/api.ts             |  10 +-
+ dashboard/frontend/src/pages/AgentDetail.tsx  |  99 +-
+ dashboard/frontend/src/pages/Agents.tsx       |  12 +-
+ dashboard/frontend/src/pages/Costs.tsx        |  29 +-
+ dashboard/frontend/src/pages/Overview.tsx     |  39 +-
+ dashboard/frontend/src/pages/Routines.tsx     |   2 +-
+ dashboard/frontend/src/recharts.d.ts          |   1 +
+ dashboard/terminal-server/package.json        |   2 +-
+ .../terminal-server/scripts/postinstall.js    |  23 +
+ dashboard/terminal-server/src/chat-bridge.js  | 650 +++++++++++-
+ dashboard/terminal-server/src/server.js       | 340 +++++-
+ .../terminal-server/src/utils/chat-logger.js  |  49 +-
+ .../src/utils/session-store.js                | 108 +-
+ ...openclaude-dashboard-handoff-2026-04-21.md | 530 ++++++++++
+ start-services.sh                             |  24 +-
+ 23 files changed, 2888 insertions(+), 333 deletions(-)
+ create mode 100644 dashboard/frontend/src/recharts.d.ts
+ create mode 100644 dashboard/terminal-server/scripts/postinstall.js
+ create mode 100644 docs/openclaude-dashboard-handoff-2026-04-21.md
+
+diff --git a/dashboard/backend/app.py b/dashboard/backend/app.py
+index 62aa031..dfb52c8 100644
+--- a/dashboard/backend/app.py
++++ b/dashboard/backend/app.py
+@@ -524,27 +524,62 @@ def api_version():
+ 
+ @app.route("/api/agents/active")
+ def api_agents_active():
+-    """Return currently active agents from hook-generated status file."""
++    """Return currently active agents from hook status + terminal chat sessions."""
+     import json
++    import requests as http_requests
+     status_file = WORKSPACE / ".claude" / "agent-status.json"
++    active = []
++    seen = set()
++    last_updated = None
++
+     try:
+         if status_file.is_file():
+             data = json.loads(status_file.read_text())
+             # Filter entries older than 10 minutes (stale)
+             from datetime import datetime, timezone, timedelta
+             cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+-            active = []
+             for entry in data.get("active_agents", []):
+                 try:
+                     started = datetime.fromisoformat(entry["started_at"].replace("Z", "+00:00"))
+                     if started > cutoff:
+-                        active.append(entry)
++                        key = (entry.get("agent"), entry.get("started_at"))
++                        if key not in seen:
++                            active.append(entry)
++                            seen.add(key)
+                 except (KeyError, ValueError):
+                     pass
+-            return {"active_agents": active, "last_updated": data.get("last_updated")}
+     except Exception:
+         pass
+-    return {"active_agents": [], "last_updated": None}
++    try:
++        resp = http_requests.get("http://localhost:32352/api/sessions/active", timeout=1.5)
++        if resp.status_code == 200:
++            data = resp.json()
++            for entry in data.get("active_sessions", []):
++                agent = entry.get("agent")
++                started_at = entry.get("startedAt")
++                if not agent:
++                    continue
++                key = (agent, started_at)
++                if key in seen:
++                    continue
++                active.append({
++                    "agent": agent,
++                    "session_id": entry.get("sessionId"),
++                    "source": "terminal_chat",
++                    "started_at": started_at,
++                    "last_activity": entry.get("lastActivity"),
++                })
++                seen.add(key)
++    except Exception:
++        pass
++
++    if status_file.is_file():
++        try:
++            data = json.loads(status_file.read_text())
++            last_updated = data.get("last_updated")
++        except Exception:
++            last_updated = None
++    return {"active_agents": active, "last_updated": last_updated}
+ 
+ 
+ # --- Version check with 1h cache ---
+diff --git a/dashboard/backend/routes/_helpers.py b/dashboard/backend/routes/_helpers.py
+index 8414f82..29b0ec5 100644
+--- a/dashboard/backend/routes/_helpers.py
++++ b/dashboard/backend/routes/_helpers.py
+@@ -1,5 +1,6 @@
+ """Shared helpers for route modules."""
+ 
++import json
+ import re
+ from pathlib import Path
+ 
+@@ -42,6 +43,136 @@ def file_info(path: Path, base: Path | None = None) -> dict:
+     return info
+ 
+ 
++def load_terminal_chat_sessions() -> list[dict]:
++    """Load persisted terminal-server chat sessions, if available."""
++    candidate_paths = [
++        WORKSPACE / ".claude-code-web" / "sessions.json",
++        Path.home() / ".claude-code-web" / "sessions.json",
++    ]
++    for sessions_file in candidate_paths:
++        content = safe_read(sessions_file)
++        if not content:
++            continue
++        try:
++            data = json.loads(content)
++        except json.JSONDecodeError:
++            continue
++        sessions = data.get("sessions")
++        if isinstance(sessions, list):
++            return sessions
++    return []
++
++
++def summarize_terminal_chat_usage() -> dict:
++    """Aggregate chat usage/cost metrics from terminal-server persisted sessions."""
++    total_cost = 0.0
++    total_requests = 0
++    total_input_tokens = 0
++    total_output_tokens = 0
++    total_cache_tokens = 0
++    total_sessions = 0
++    by_agent = {}
++    by_day = {}
++
++    for session in load_terminal_chat_sessions():
++        usage = session.get("sessionUsage") or {}
++        cost = float(usage.get("totalCost", 0) or 0)
++        requests = int(usage.get("requests", 0) or 0)
++        input_tokens = int(usage.get("inputTokens", 0) or 0)
++        output_tokens = int(usage.get("outputTokens", 0) or 0)
++        cache_tokens = int(usage.get("cacheTokens", 0) or 0)
++        agent = session.get("agentName") or "chat"
++        created = str(session.get("created") or "")[:10]
++
++        if cost <= 0 and requests <= 0 and input_tokens <= 0 and output_tokens <= 0 and cache_tokens <= 0:
++            continue
++
++        total_sessions += 1
++        total_cost += cost
++        total_requests += requests
++        total_input_tokens += input_tokens
++        total_output_tokens += output_tokens
++        total_cache_tokens += cache_tokens
++
++        if agent not in by_agent:
++            by_agent[agent] = {
++                "agent": agent,
++                "cost": 0.0,
++                "requests": 0,
++                "input_tokens": 0,
++                "output_tokens": 0,
++                "cache_tokens": 0,
++                "sessions": 0,
++            }
++
++        by_agent[agent]["cost"] += cost
++        by_agent[agent]["requests"] += requests
++        by_agent[agent]["input_tokens"] += input_tokens
++        by_agent[agent]["output_tokens"] += output_tokens
++        by_agent[agent]["cache_tokens"] += cache_tokens
++        by_agent[agent]["sessions"] += 1
++
++        if created:
++            by_day[created] = by_day.get(created, 0.0) + cost
++
++    return {
++        "total_cost": round(total_cost, 4),
++        "requests": total_requests,
++        "input_tokens": total_input_tokens,
++        "output_tokens": total_output_tokens,
++        "cache_tokens": total_cache_tokens,
++        "total_tokens": total_input_tokens + total_output_tokens,
++        "sessions": total_sessions,
++        "by_agent": sorted(by_agent.values(), key=lambda item: item["cost"], reverse=True),
++        "by_day": by_day,
++    }
++
++
++def agent_supports_persistent_memory(agent_name: str) -> bool:
++    """Infer whether an agent is documented as having persistent memory."""
++    agent_path = WORKSPACE / ".claude" / "agents" / f"{agent_name}.md"
++    content = safe_read(agent_path)
++    if not content:
++        return False
++
++    lowered = content.lower()
++    if "no persistent agent memory" in lowered:
++        return False
++
++    return (
++        ".claude/agent-memory/" in content
++        or "always read your memory folder first" in lowered
++        or "persistent, file-based memory system" in lowered
++        or "## memory" in lowered
++    )
++
++
++def count_agent_memory_entries(agent_name: str) -> int:
++    """Count effective memory entries for an agent, respecting MEMORY.md semantics."""
++    if not agent_supports_persistent_memory(agent_name):
++        return 0
++
++    mem_dir = WORKSPACE / ".claude" / "agent-memory" / agent_name
++    if not mem_dir.is_dir():
++        return 0
++
++    memory_index = mem_dir / "MEMORY.md"
++    content = safe_read(memory_index)
++    if content:
++        lines = [
++            line.strip()
++            for line in content.splitlines()
++            if line.strip().startswith("- ")
++        ]
++        return len(lines)
++
++    fallback_files = [
++        f for f in mem_dir.iterdir()
++        if f.is_file() and f.name not in {"MEMORY.md", "_improvements.md"}
++    ]
++    return len(fallback_files)
++
++
+ # ── Dynamic routine discovery ─────────────────────────
+ 
+ # Agent name mapping: lowercase variations found in docstrings → canonical name
+diff --git a/dashboard/backend/routes/agents.py b/dashboard/backend/routes/agents.py
+index 28fdef5..f7fe4ba 100644
+--- a/dashboard/backend/routes/agents.py
++++ b/dashboard/backend/routes/agents.py
+@@ -2,7 +2,14 @@
+ 
+ from flask import Blueprint, jsonify, abort, Response
+ from flask_login import login_required, current_user
+-from routes._helpers import WORKSPACE, safe_read, parse_frontmatter, file_info
++from routes._helpers import (
++    WORKSPACE,
++    safe_read,
++    parse_frontmatter,
++    file_info,
++    agent_supports_persistent_memory,
++    count_agent_memory_entries,
++)
+ from models import has_agent_access
+ 
+ bp = Blueprint("agents", __name__)
+@@ -11,13 +18,6 @@ AGENTS_DIR = WORKSPACE / ".claude" / "agents"
+ AGENT_MEMORY_DIR = WORKSPACE / ".claude" / "agent-memory"
+ 
+ 
+-def _count_memory(name: str) -> int:
+-    mem_dir = AGENT_MEMORY_DIR / name
+-    if not mem_dir.is_dir():
+-        return 0
+-    return sum(1 for f in mem_dir.iterdir() if f.is_file())
+-
+-
+ @bp.route("/api/agents")
+ @login_required
+ def list_agents():
+@@ -30,10 +30,12 @@ def list_agents():
+             content = safe_read(f) or ""
+             fm = parse_frontmatter(content)
+             name = f.stem
++            supports_memory = agent_supports_persistent_memory(name)
+             entry = {
+                 "name": name,
+                 "description": fm.get("description", ""),
+-                "memory_count": _count_memory(name),
++                "memory_count": count_agent_memory_entries(name),
++                "supports_memory": supports_memory,
+                 "custom": name.startswith("custom-"),
+                 "locked": not has_agent_access(role, name),
+             }
+@@ -59,6 +61,9 @@ def get_agent(name):
+ 
+ @bp.route("/api/agents/<name>/memory")
+ def list_agent_memory(name):
++    if not agent_supports_persistent_memory(name):
++        return jsonify([])
++
+     mem_dir = (AGENT_MEMORY_DIR / name).resolve()
+     try:
+         mem_dir.relative_to(AGENT_MEMORY_DIR.resolve())
+@@ -68,7 +73,7 @@ def list_agent_memory(name):
+         return jsonify([])
+     files = []
+     for f in sorted(mem_dir.iterdir()):
+-        if f.is_file():
++        if f.is_file() and f.name != "_improvements.md":
+             files.append(file_info(f, mem_dir))
+     return jsonify(files)
+ 
+diff --git a/dashboard/backend/routes/costs.py b/dashboard/backend/routes/costs.py
+index 4ef0cf5..c61a445 100644
+--- a/dashboard/backend/routes/costs.py
++++ b/dashboard/backend/routes/costs.py
+@@ -3,7 +3,7 @@
+ import json
+ from datetime import date, timedelta
+ from flask import Blueprint, jsonify, request
+-from routes._helpers import WORKSPACE, safe_read
++from routes._helpers import WORKSPACE, safe_read, summarize_terminal_chat_usage
+ from models import db, Heartbeat, HeartbeatRun
+ from sqlalchemy import func
+ 
+@@ -16,17 +16,17 @@ LOGS_DIR = WORKSPACE / "ADWs" / "logs"
+ @bp.route("/api/costs")
+ def costs_summary():
+     content = safe_read(METRICS_PATH)
+-    if not content:
+-        return jsonify({"total_cost": 0, "by_routine": [], "by_agent": [], "today": 0, "week": 0, "month_estimate": 0})
+-
++    data = {}
+     try:
+-        data = json.loads(content)
++        if content:
++            data = json.loads(content)
+     except json.JSONDecodeError:
+-        return jsonify({"total_cost": 0, "by_routine": [], "by_agent": [], "today": 0, "week": 0, "month_estimate": 0})
++        data = {}
+ 
+     total = 0.0
+     by_routine = []
+     agent_costs = {}
++    chat_usage = summarize_terminal_chat_usage()
+ 
+     if isinstance(data, dict):
+         for name, val in data.items():
+@@ -49,6 +49,10 @@ def costs_summary():
+                 })
+                 agent_costs[agent] = agent_costs.get(agent, 0.0) + cost
+ 
++    for chat_agent in chat_usage["by_agent"]:
++        agent = chat_agent["agent"]
++        agent_costs[agent] = agent_costs.get(agent, 0.0) + float(chat_agent.get("cost", 0) or 0)
++
+     by_agent = [{"agent": a, "cost": round(c, 4)} for a, c in sorted(agent_costs.items(), key=lambda x: x[1], reverse=True)]
+ 
+     # Aggregate heartbeat costs from DB
+@@ -111,6 +115,13 @@ def costs_summary():
+                 if ts >= week_start:
+                     week_cost += cost_val
+ 
++    for day, cost_val in chat_usage["by_day"].items():
++        daily_costs[day] = daily_costs.get(day, 0.0) + cost_val
++        if day == today_str:
++            today_cost += cost_val
++        if day >= week_start:
++            week_cost += cost_val
++
+     # Add heartbeat daily costs from DB
+     hb_daily_rows = (
+         db.session.query(
+@@ -132,17 +143,24 @@ def costs_summary():
+ 
+     daily = [{"date": k, "cost": round(v, 4)} for k, v in sorted(daily_costs.items())]
+ 
+-    grand_total = total + hb_total
++    grand_total = total + hb_total + chat_usage["total_cost"]
+     routine_runs_total = sum(r["runs"] for r in by_routine)
+ 
+     return jsonify({
+         "total_cost": round(grand_total, 4),
+         "routines_total_cost": round(total, 4),
+         "heartbeats_total_cost": round(hb_total, 4),
++        "chat_total_cost": round(chat_usage["total_cost"], 4),
++        "chat_total_tokens": chat_usage["total_tokens"],
++        "chat_input_tokens": chat_usage["input_tokens"],
++        "chat_output_tokens": chat_usage["output_tokens"],
++        "chat_cache_tokens": chat_usage["cache_tokens"],
++        "chat_requests": chat_usage["requests"],
++        "chat_sessions": chat_usage["sessions"],
+         "today": round(today_cost, 4),
+         "week": round(week_cost, 4),
+         "month_estimate": round(grand_total, 4),
+-        "total_runs": routine_runs_total + hb_runs_total,
++        "total_runs": routine_runs_total + hb_runs_total + chat_usage["requests"],
+         "daily": daily,
+         "by_routine": by_routine,
+         "by_heartbeat": by_heartbeat,
+@@ -154,6 +172,7 @@ def costs_summary():
+ def costs_daily():
+     from_date = request.args.get("from", (date.today() - timedelta(days=7)).isoformat())
+     to_date = request.args.get("to", date.today().isoformat())
++    chat_usage = summarize_terminal_chat_usage()
+ 
+     routines_daily = {}
+     if LOGS_DIR.is_dir():
+@@ -195,16 +214,23 @@ def costs_daily():
+             heartbeats_daily[row.day] = float(row.cost or 0)
+ 
+     # Merge all days
+-    all_days = set(routines_daily.keys()) | set(heartbeats_daily.keys())
++    chat_daily = {
++        day: float(cost or 0)
++        for day, cost in chat_usage["by_day"].items()
++        if from_date <= day <= to_date
++    }
++    all_days = set(routines_daily.keys()) | set(heartbeats_daily.keys()) | set(chat_daily.keys())
+     combined = []
+     for day in sorted(all_days):
+         r_cost = routines_daily.get(day, 0.0)
+         h_cost = heartbeats_daily.get(day, 0.0)
++        c_cost = chat_daily.get(day, 0.0)
+         combined.append({
+             "date": day,
+-            "cost": round(r_cost + h_cost, 4),
++            "cost": round(r_cost + h_cost + c_cost, 4),
+             "routines_cost": round(r_cost, 4),
+             "heartbeats_cost": round(h_cost, 4),
++            "chat_cost": round(c_cost, 4),
+         })
+ 
+     return jsonify(combined)
+diff --git a/dashboard/backend/routes/memory.py b/dashboard/backend/routes/memory.py
+index 21a3a94..8b4d587 100644
+--- a/dashboard/backend/routes/memory.py
++++ b/dashboard/backend/routes/memory.py
+@@ -1,7 +1,13 @@
+ """Memory endpoint — global and per-agent memory files."""
+ 
+ from flask import Blueprint, jsonify, abort, Response
+-from routes._helpers import WORKSPACE, safe_read, file_info
++from routes._helpers import (
++    WORKSPACE,
++    safe_read,
++    file_info,
++    agent_supports_persistent_memory,
++    count_agent_memory_entries,
++)
+ 
+ bp = Blueprint("memory", __name__)
+ 
+@@ -22,8 +28,10 @@ def memory_index():
+     agent_counts = {}
+     if AGENT_MEMORY_DIR.is_dir():
+         for d in sorted(AGENT_MEMORY_DIR.iterdir()):
+-            if d.is_dir():
+-                count = sum(1 for f in d.iterdir() if f.is_file())
++            if d.is_dir() and agent_supports_persistent_memory(d.name):
++                count = count_agent_memory_entries(d.name)
++                if count <= 0:
++                    continue
+                 agent_counts[d.name] = count
+ 
+     return jsonify({
+@@ -66,11 +74,14 @@ def get_memory_file(filepath):
+ 
+ @bp.route("/api/memory/agents/<name>")
+ def list_agent_memories(name):
++    if not agent_supports_persistent_memory(name):
++        return jsonify([])
++
+     mem_dir = AGENT_MEMORY_DIR / name
+     if not mem_dir.is_dir():
+         return jsonify([])
+     files = []
+     for f in sorted(mem_dir.iterdir()):
+-        if f.is_file():
++        if f.is_file() and f.name != "_improvements.md":
+             files.append(file_info(f, mem_dir))
+     return jsonify(files)
+diff --git a/dashboard/backend/routes/overview.py b/dashboard/backend/routes/overview.py
+index 79df49b..0f709fe 100644
+--- a/dashboard/backend/routes/overview.py
++++ b/dashboard/backend/routes/overview.py
+@@ -3,7 +3,7 @@
+ import json
+ from datetime import datetime
+ from flask import Blueprint, jsonify
+-from routes._helpers import WORKSPACE, safe_read
++from routes._helpers import WORKSPACE, safe_read, summarize_terminal_chat_usage
+ 
+ bp = Blueprint("overview", __name__)
+ 
+@@ -72,13 +72,21 @@ def _build_overview_metrics(raw_metrics: dict, integration_count: int) -> list[d
+     total_cost = sum(v.get("total_cost_usd", 0) for v in raw_metrics.values())
+     total_success = sum(v.get("successes", 0) for v in raw_metrics.values())
+     success_rate = round((total_success / total_runs * 100), 1) if total_runs > 0 else 0
++    chat_usage = summarize_terminal_chat_usage()
++    combined_cost = total_cost + chat_usage["total_cost"]
++    combined_runs = total_runs + chat_usage["requests"]
+ 
+     agents_count = len(list((WORKSPACE / ".claude" / "agents").glob("*.md"))) if (WORKSPACE / ".claude" / "agents").is_dir() else 0
+     skills_count = len([d for d in (WORKSPACE / ".claude" / "skills").iterdir() if d.is_dir()]) if (WORKSPACE / ".claude" / "skills").is_dir() else 0
+ 
+     return [
+         {"label": "Routines Executed", "value": total_runs, "delta": f"{success_rate}% success", "deltaType": "up" if success_rate >= 90 else "neutral"},
+-        {"label": "Total Cost", "value": f"${total_cost:.2f}", "delta": f"${total_cost / max(total_runs, 1):.2f}/run", "deltaType": "neutral"},
++        {
++            "label": "Total Cost",
++            "value": f"${combined_cost:.2f}",
++            "delta": f"chat ${chat_usage['total_cost']:.2f} • ${combined_cost / max(combined_runs, 1):.2f}/run",
++            "deltaType": "neutral",
++        },
+         {"label": "Agents", "value": agents_count, "delta": f"{skills_count} skills", "deltaType": "neutral"},
+         {"label": "Active Integrations", "value": integration_count},
+     ]
+diff --git a/dashboard/frontend/package-lock.json b/dashboard/frontend/package-lock.json
+index b57c880..8015380 100644
+--- a/dashboard/frontend/package-lock.json
++++ b/dashboard/frontend/package-lock.json
+@@ -77,7 +77,6 @@
+       "integrity": "sha512-CGOfOJqWjg2qW/Mb6zNsDm+u5vFQ8DxXfbM09z69p5Z6+mE1ikP2jUXw+j42Pf1XTYED2Rni5f95npYeuwMDQA==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@babel/code-frame": "^7.29.0",
+         "@babel/generator": "^7.29.0",
+@@ -452,6 +451,29 @@
+         "w3c-keyname": "^2.2.4"
+       }
+     },
++    "node_modules/@emnapi/core": {
++      "version": "1.10.0",
++      "resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.10.0.tgz",
++      "integrity": "sha512-yq6OkJ4p82CAfPl0u9mQebQHKPJkY7WrIuk205cTYnYe+k2Z8YBh11FrbRG/H6ihirqcacOgl2BIO8oyMQLeXw==",
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "dependencies": {
++        "@emnapi/wasi-threads": "1.2.1",
++        "tslib": "^2.4.0"
++      }
++    },
++    "node_modules/@emnapi/runtime": {
++      "version": "1.10.0",
++      "resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.10.0.tgz",
++      "integrity": "sha512-ewvYlk86xUoGI0zQRNq/mC+16R1QeDlKQy21Ki3oSYXNgLb45GV1P6A0M+/s6nyCuNDqe5VpaY84BzXGwVbwFA==",
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "dependencies": {
++        "tslib": "^2.4.0"
++      }
++    },
+     "node_modules/@emnapi/wasi-threads": {
+       "version": "1.2.1",
+       "resolved": "https://registry.npmjs.org/@emnapi/wasi-threads/-/wasi-threads-1.2.1.tgz",
+@@ -1615,7 +1637,6 @@
+       "integrity": "sha512-A1sre26ke7HDIuY/M23nd9gfB+nrmhtYyMINbjI1zHJxYteKR6qSMX56FsmjMcDb3SMcjJg5BiRRgOCC/yBD0g==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "undici-types": "~7.16.0"
+       }
+@@ -1626,7 +1647,6 @@
+       "integrity": "sha512-ilcTH/UniCkMdtexkoCN0bI7pMcJDvmQFPvuPvmEaYA/NSfFTAgdUSLAoVjaRJm7+6PvcM+q1zYOwS4wTYMF9w==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "csstype": "^3.2.2"
+       }
+@@ -1699,7 +1719,6 @@
+       "integrity": "sha512-gGkiNMPqerb2cJSVcruigx9eHBlLG14fSdPdqMoOcBfh+vvn4iCq2C8MzUB89PrxOXk0y3GZ1yIWb9aOzL93bw==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@typescript-eslint/scope-manager": "8.58.1",
+         "@typescript-eslint/types": "8.58.1",
+@@ -2010,7 +2029,6 @@
+       "integrity": "sha512-UVJyE9MttOsBQIDKw1skb9nAwQuR5wuGD3+82K6JgJlm/Y+KI92oNsMNGZCYdDsVtRHSak0pcV5Dno5+4jh9sw==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "bin": {
+         "acorn": "bin/acorn"
+       },
+@@ -2129,7 +2147,6 @@
+         }
+       ],
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "baseline-browser-mapping": "^2.10.12",
+         "caniuse-lite": "^1.0.30001782",
+@@ -2611,7 +2628,6 @@
+       "integrity": "sha512-XoMjdBOwe/esVgEvLmNsD3IRHkm7fbKIUGvrleloJXUZgDHig2IPWNniv+GwjyJXzuNqVjlr5+4yVUZjycJwfQ==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@eslint-community/eslint-utils": "^4.8.0",
+         "@eslint-community/regexpp": "^4.12.1",
+@@ -4656,7 +4672,6 @@
+       "integrity": "sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "engines": {
+         "node": ">=12"
+       },
+@@ -4729,7 +4744,6 @@
+       "resolved": "https://registry.npmjs.org/react/-/react-19.2.5.tgz",
+       "integrity": "sha512-llUJLzz1zTUBrskt2pwZgLq59AemifIftw4aB7JxOqf1HY2FDaGDxgwpAPVzHU1kdWabH7FauP4i1oEeer2WCA==",
+       "license": "MIT",
+-      "peer": true,
+       "engines": {
+         "node": ">=0.10.0"
+       }
+@@ -4739,7 +4753,6 @@
+       "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.5.tgz",
+       "integrity": "sha512-J5bAZz+DXMMwW/wV3xzKke59Af6CHY7G4uYLN1OvBcKEsWOs4pQExj86BBKamxl/Ik5bx9whOrvBlSDfWzgSag==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "scheduler": "^0.27.0"
+       },
+@@ -4789,7 +4802,6 @@
+       "integrity": "sha512-ROY9fvHhwOD9ySfrF0wmvu//bKCQ6AeZZq1nJNtbDC+kk5DuSuNX/n6YWYF/SYy7bSba4D4FSz8DJeKY/S/r+g==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@types/use-sync-external-store": "^0.0.6",
+         "use-sync-external-store": "^1.4.0"
+@@ -4884,8 +4896,7 @@
+       "resolved": "https://registry.npmjs.org/redux/-/redux-5.0.1.tgz",
+       "integrity": "sha512-M9/ELqF6fy8FwmkpnF0S3YKOqMyoWJ4+CS5Efg2ct3oY9daQvd/Pc71FpGZsVsbl3Cpb+IIcjBDUnnyBdQbq4w==",
+       "dev": true,
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/redux-thunk": {
+       "version": "3.1.0",
+@@ -5262,7 +5273,6 @@
+       "integrity": "sha512-bGdAIrZ0wiGDo5l8c++HWtbaNCWTS4UTv7RaTH/ThVIgjkveJt83m74bBHMJkuCbslY8ixgLBVZJIOiQlQTjfQ==",
+       "dev": true,
+       "license": "Apache-2.0",
+-      "peer": true,
+       "bin": {
+         "tsc": "bin/tsc",
+         "tsserver": "bin/tsserver"
+@@ -5498,7 +5508,6 @@
+       "integrity": "sha512-P1PbweD+2/udplnThz3btF4cf6AgPky7kk23RtHUkJIU5BIxwPprhRGmOAHs6FTI7UiGbTNrgNP6jSYD6JaRnw==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "lightningcss": "^1.32.0",
+         "picomatch": "^4.0.4",
+@@ -5636,7 +5645,6 @@
+       "integrity": "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "funding": {
+         "url": "https://github.com/sponsors/colinhacks"
+       }
+diff --git a/dashboard/frontend/src/components/AgentChat.tsx b/dashboard/frontend/src/components/AgentChat.tsx
+index 81ccfac..c9cfb90 100644
+--- a/dashboard/frontend/src/components/AgentChat.tsx
++++ b/dashboard/frontend/src/components/AgentChat.tsx
+@@ -40,6 +40,8 @@ interface AgentChatProps {
+   accentColor?: string
+   externalLoading?: boolean
+   externalError?: string | null
++  onSessionCreated?: (session: { id: string; name: string; active: boolean; ts: number }) => void
++  onSessionMetaChange?: (sessionId: string, patch: { active?: boolean; preview?: string; ts?: number; ticketId?: string | null }) => void
+   onPendingCountChange?: (sessionId: string, count: number) => void
+   onNeedsAttention?: (sessionId: string) => void
+ }
+@@ -69,11 +71,226 @@ type ChatMessage =
+ type AssistantBlock =
+   | { type: 'text'; text: string }
+   | { type: 'thinking'; text: string }
+-  | { type: 'tool_use'; toolName: string; toolId: string; input: string; result?: string; done?: boolean; subagentType?: string; subagentStatus?: string; subagentSummary?: string; subagentTools?: Array<{ toolName: string; input: string; toolUseId: string; ts: number }> }
++  | { type: 'tool_use'; toolName: string; toolId: string; input: string; result?: string; done?: boolean; subagentType?: string; subagentStatus?: string; subagentSummary?: string; subagentTools?: Array<{ toolName: string; input: string; toolUseId: string; ts: number }>; elicitationRequestId?: string; elicitationMode?: 'form' | 'url'; elicitationMessage?: string; elicitationRequestedSchema?: unknown; elicitationSubmitted?: boolean }
+ 
+ type Status = 'idle' | 'connecting' | 'running' | 'error'
+ 
+-export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', externalLoading = false, externalError = null, onPendingCountChange, onNeedsAttention }: AgentChatProps) {
++function safeText(value: unknown) {
++  if (typeof value === 'string') return value
++  if (value === null || value === undefined) return ''
++  try {
++    return JSON.stringify(value)
++  } catch {
++    return String(value)
++  }
++}
++
++function getToolLabel(toolName: string) {
++  switch (toolName) {
++    case 'Bash':
++      return 'Bash'
++    case 'AskUserQuestion':
++      return 'AskUserQuestion'
++    case 'TodoWrite':
++      return 'TodoWrite'
++    default:
++      return safeText(toolName)
++  }
++}
++
++function getToolIcon(toolName: string, accentColor: string, size = 13, className = '') {
++  const props = { size, className, style: className ? undefined : { color: accentColor } }
++
++  switch (toolName) {
++    case 'Bash':
++      return <TermIcon {...props} />
++    case 'Read':
++      return <FileText {...props} />
++    case 'Write':
++    case 'Edit':
++      return <Edit2 {...props} />
++    case 'AskUserQuestion':
++      return <ShieldAlert {...props} />
++    case 'TodoWrite':
++      return <CheckCircle2 {...props} />
++    default:
++      return <FileCode {...props} />
++  }
++}
++
++function summarizeToolInput(toolName: string, parsedInput: any, rawInput = '') {
++  if (toolName === 'Bash') {
++    return safeText(parsedInput?.command || rawInput).replace(/\s+/g, ' ').trim()
++  }
++
++  if (toolName === 'Read') {
++    return safeText(parsedInput?.file_path || parsedInput?.path || rawInput)
++  }
++
++  if (toolName === 'Write' || toolName === 'Edit') {
++    return safeText(parsedInput?.file_path || parsedInput?.path || rawInput)
++  }
++
++  if (toolName === 'Glob') {
++    return safeText(parsedInput?.pattern || parsedInput?.path || rawInput)
++  }
++
++  if (toolName === 'Grep') {
++    return safeText(parsedInput?.pattern || parsedInput?.query || rawInput)
++  }
++
++  if (toolName === 'AskUserQuestion') {
++    const questions = Array.isArray(parsedInput?.questions) ? parsedInput.questions : []
++    const firstQuestion = safeText(questions[0]?.question || '')
++    if (questions.length === 0) return ''
++    return questions.length === 1 ? firstQuestion : `${questions.length} questions`
++  }
++
++  if (toolName === 'TodoWrite') {
++    const todos = Array.isArray(parsedInput?.todos) ? parsedInput.todos : []
++    const completed = todos.filter((todo: any) => todo?.status === 'completed').length
++    return todos.length > 0 ? `${completed}/${todos.length} done` : ''
++  }
++
++  return safeText(
++    parsedInput?.command
++    || parsedInput?.file_path
++    || parsedInput?.path
++    || parsedInput?.pattern
++    || parsedInput?.description
++    || rawInput,
++  )
++}
++
++function getToolDetailRows(toolName: string, parsedInput: any) {
++  if (toolName === 'Bash') {
++    const command = safeText(parsedInput?.command || '').replace(/\s+/g, ' ').trim()
++    return {
++      primary: command,
++      secondary: '',
++      chips: [
++        parsedInput?.timeout ? `${parsedInput.timeout}ms` : '',
++        parsedInput?.run_in_background ? 'background' : '',
++      ].filter(Boolean) as string[],
++    }
++  }
++
++  if (toolName === 'Read') {
++    const filePath = safeText(parsedInput?.file_path || parsedInput?.path || '')
++    const pages = Array.isArray(parsedInput?.pages) && parsedInput.pages.length > 0
++      ? `pages ${parsedInput.pages.join(', ')}`
++      : ''
++    const offset = parsedInput?.offset !== undefined && parsedInput?.offset !== null ? `offset ${parsedInput.offset}` : ''
++    const limit = parsedInput?.limit ? `limit ${parsedInput.limit}` : ''
++    return {
++      primary: filePath,
++      secondary: '',
++      chips: [pages, offset, limit].filter(Boolean) as string[],
++    }
++  }
++
++  if (toolName === 'Write' || toolName === 'Edit') {
++    const filePath = safeText(parsedInput?.file_path || parsedInput?.path || '')
++    return {
++      primary: filePath,
++      secondary: '',
++      chips: [],
++    }
++  }
++
++  if (toolName === 'Glob') {
++    return {
++      primary: safeText(parsedInput?.pattern || ''),
++      secondary: safeText(parsedInput?.path || ''),
++      chips: [],
++    }
++  }
++
++  if (toolName === 'Grep') {
++    return {
++      primary: safeText(parsedInput?.pattern || parsedInput?.query || ''),
++      secondary: safeText(parsedInput?.path || ''),
++      chips: [],
++    }
++  }
++
++  return {
++    primary: summarizeToolInput(toolName, parsedInput),
++    secondary: '',
++    chips: [],
++  }
++}
++
++function normalizeAssistantBlock(block: any): AssistantBlock {
++  if (!block || typeof block !== 'object') {
++    return { type: 'text', text: safeText(block) }
++  }
++
++  if (block.type === 'text' || block.type === 'thinking') {
++    return { ...block, text: safeText(block.text) }
++  }
++
++  if (block.type === 'tool_use') {
++    return {
++      ...block,
++      toolName: safeText(block.toolName || block.name),
++      toolId: safeText(block.toolId || block.id),
++      input: safeText(block.input),
++      result: block.result === undefined ? undefined : safeText(block.result),
++      subagentType: block.subagentType ? safeText(block.subagentType) : undefined,
++      subagentStatus: block.subagentStatus ? safeText(block.subagentStatus) : undefined,
++      subagentSummary: block.subagentSummary ? safeText(block.subagentSummary) : undefined,
++      subagentTools: Array.isArray(block.subagentTools)
++        ? block.subagentTools.map((tool: any) => ({
++            toolName: safeText(tool?.toolName),
++            input: safeText(tool?.input),
++            toolUseId: safeText(tool?.toolUseId),
++            ts: typeof tool?.ts === 'number' ? tool.ts : Date.now(),
++          }))
++        : undefined,
++      elicitationRequestId: block.elicitationRequestId ? safeText(block.elicitationRequestId) : undefined,
++      elicitationMode: block.elicitationMode === 'url' ? 'url' : 'form',
++      elicitationMessage: block.elicitationMessage ? safeText(block.elicitationMessage) : undefined,
++      elicitationRequestedSchema: block.elicitationRequestedSchema,
++      elicitationSubmitted: !!block.elicitationSubmitted,
++      done: block.done === undefined ? undefined : !!block.done,
++    }
++  }
++
++  return { type: 'text', text: safeText(block.text ?? block) }
++}
++
++function normalizeChatMessage(message: any): ChatMessage {
++  if (message?.role === 'assistant') {
++    const blocks = Array.isArray(message.blocks) ? message.blocks.map(normalizeAssistantBlock) : []
++    return {
++      role: 'assistant',
++      blocks,
++      ts: typeof message.ts === 'number' ? message.ts : Date.now(),
++      streaming: !!message.streaming,
++      uuid: message.uuid,
++    }
++  }
++
++  if (message?.role === 'system') {
++    return {
++      role: 'system',
++      text: safeText(message.text),
++      ts: typeof message.ts === 'number' ? message.ts : Date.now(),
++      uuid: message.uuid,
++    }
++  }
++
++  return {
++    role: 'user',
++    text: safeText(message?.text),
++    files: Array.isArray(message?.files) ? message.files : undefined,
++    ts: typeof message?.ts === 'number' ? message.ts : Date.now(),
++    uuid: message?.uuid,
++  }
++}
++
++export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', externalLoading = false, externalError = null, onSessionCreated, onSessionMetaChange, onPendingCountChange, onNeedsAttention }: AgentChatProps) {
+   const { dismissBySession } = useNotifications()
+   const [messages, setMessages] = useState<ChatMessage[]>([])
+   const [input, setInput] = useState('')
+@@ -90,6 +307,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+     open: false, query: '', items: [], selectedIndex: 0, anchorStart: -1,
+   })
+   const [pendingApprovals, setPendingApprovals] = useState<PermissionRequest[]>([])
++  const [latestElicitationRequestId, setLatestElicitationRequestId] = useState<string | null>(null)
+   const [editingUuid, setEditingUuid] = useState<string | null>(null)
+   const [editingText, setEditingText] = useState('')
+   const [copiedIndex, setCopiedIndex] = useState<number | null>(null)
+@@ -100,6 +318,14 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+   const pingRef = useRef<ReturnType<typeof setInterval> | null>(null)
+   const dragCounterRef = useRef(0)
+   const subagentToolRef = useRef<{ toolName: string; toolUseId: string; input: string; parentToolUseId: string } | null>(null)
++  const latestElicitationRequestIdRef = useRef<string | null>(null)
++  const pendingElicitationsRef = useRef<Array<{
++    requestId: string
++    mode?: 'form' | 'url'
++    message?: string
++    requestedSchema?: unknown
++  }>>([])
++  const pendingInitialSendRef = useRef<{ text: string; files: AttachedFile[] } | null>(null)
+ 
+   // Auto-dismiss global notifications when the user opens this session
+   useEffect(() => {
+@@ -108,6 +334,10 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+     }
+   }, [sessionId, dismissBySession])
+ 
++  useEffect(() => {
++    latestElicitationRequestIdRef.current = latestElicitationRequestId
++  }, [latestElicitationRequestId])
++
+   // Notify parent when pending approvals count changes
+   useEffect(() => {
+     if (sessionId && onPendingCountChange) {
+@@ -115,6 +345,16 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+     }
+   }, [pendingApprovals.length, sessionId, onPendingCountChange])
+ 
++  useEffect(() => {
++    if (!sessionId) {
++      setMessages([])
++      setPendingApprovals([])
++      setTicketId(null)
++      setStatus('idle')
++      setErrorMsg(null)
++    }
++  }, [sessionId])
++
+   // Auto-scroll to bottom
+   const scrollToBottom = useCallback(() => {
+     requestAnimationFrame(() => {
+@@ -128,6 +368,9 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+   useEffect(() => {
+     if (!sessionId) return
+ 
++    setMessages([])
++    setPendingApprovals([])
++    setTicketId(null)
+     setStatus('connecting')
+     setErrorMsg(null)
+     let cancelled = false
+@@ -166,20 +409,26 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+             // Restore chat history from server — preserve uuid from each message
+             if (msg.chatHistory && msg.chatHistory.length > 0) {
+               setMessages(msg.chatHistory.map((m: any) => ({
+-                ...m,
+-                uuid: m.uuid,
++                ...normalizeChatMessage(m),
+                 streaming: false,
+               })))
+               scrollToBottom()
+             }
+             // Restore ticket binding (Feature 1.3)
+             setTicketId(msg.ticketId || null)
++            if (sessionId) {
++              onSessionMetaChange?.(sessionId, {
++                active: false,
++                ts: Date.now(),
++                ticketId: msg.ticketId || null,
++              })
++            }
+             break
+ 
+           case 'chat_history':
+             // Fallback history restore
+             if (msg.messages?.length > 0) {
+-              setMessages(msg.messages.map((m: any) => ({ ...m, streaming: false })))
++              setMessages(msg.messages.map((m: any) => ({ ...normalizeChatMessage(m), streaming: false })))
+               scrollToBottom()
+             }
+             break
+@@ -191,6 +440,12 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+           case 'ticket_bound':
+             if (msg.ticketId) {
+               setTicketId(msg.ticketId)
++              if (sessionId) {
++                onSessionMetaChange?.(sessionId, {
++                  ticketId: msg.ticketId,
++                  ts: Date.now(),
++                })
++              }
+             }
+             break
+ 
+@@ -229,18 +484,37 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+             }
+             break
+ 
++          case 'elicitation_request':
++            if (msg.requestId) {
++              handleChatEvent(msg)
++            }
++            break
++
+           case 'chat_error':
+             setStatus('error')
+             setIsThinking(false)
+             setPendingApprovals([])
+             setErrorMsg(msg.message || 'Unknown error')
+             setMessages(prev => [...prev, { role: 'system', text: `Error: ${msg.message}`, ts: Date.now() }])
++            if (sessionId) {
++              onSessionMetaChange?.(sessionId, {
++                active: false,
++                preview: `Error: ${msg.message || 'Unknown error'}`,
++                ts: Date.now(),
++              })
++            }
+             break
+ 
+           case 'chat_complete':
+             setStatus('idle')
+             setIsThinking(false)
+             setPendingApprovals([])
++            if (sessionId) {
++              onSessionMetaChange?.(sessionId, {
++                active: false,
++                ts: Date.now(),
++              })
++            }
+             // Signal unread response when user is in another tab
+             if (document.hidden && sessionId && onNeedsAttention) {
+               onNeedsAttention(sessionId)
+@@ -285,7 +559,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+       try { ws?.close() } catch {}
+       wsRef.current = null
+     }
+-  }, [sessionId])
++  }, [sessionId, agent, onNeedsAttention, onSessionMetaChange, scrollToBottom])
+ 
+   // Revoke object URLs on unmount
+   useEffect(() => {
+@@ -321,6 +595,66 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+       .catch(() => {})
+   }, [showTicketPicker, agent])
+ 
++  const performSend = useCallback(async (text: string, filesSnapshot: AttachedFile[]) => {
++    if ((!text && filesSnapshot.length === 0) || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
++
++    const fileMeta: FileRef[] = filesSnapshot.map(f => ({
++      name: f.name,
++      type: f.type,
++      previewUrl: f.previewUrl,
++    }))
++
++    const filesForServer: FileRef[] = []
++    for (const af of filesSnapshot) {
++      const base64 = await fileToBase64(af.file)
++      filesForServer.push({
++        name: af.name,
++        type: af.type,
++        base64,
++      })
++    }
++
++    setMessages(prev => [...prev, {
++      role: 'user' as const,
++      text,
++      files: fileMeta.length > 0 ? fileMeta : undefined,
++      ts: Date.now(),
++    }])
++
++    setInput('')
++    setAttachedFiles([])
++    setStatus('running')
++    setErrorMsg(null)
++    if (sessionId) {
++      onSessionMetaChange?.(sessionId, {
++        active: true,
++        preview: text || (filesSnapshot.length > 0 ? `[${filesSnapshot.length} attachment${filesSnapshot.length > 1 ? 's' : ''}]` : ''),
++        ts: Date.now(),
++      })
++    }
++
++    wsRef.current.send(JSON.stringify({
++      type: 'chat_send',
++      prompt: text,
++      files: filesForServer.length > 0 ? filesForServer : undefined,
++    }))
++
++    scrollToBottom()
++    if (inputRef.current) {
++      inputRef.current.style.height = 'auto'
++      inputRef.current.focus()
++    }
++  }, [scrollToBottom, sessionId, onSessionMetaChange])
++
++  useEffect(() => {
++    if (!sessionId || !pendingInitialSendRef.current) return
++    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || status !== 'idle') return
++
++    const pending = pendingInitialSendRef.current
++    pendingInitialSendRef.current = null
++    void performSend(pending.text, pending.files)
++  }, [sessionId, status, performSend])
++
+   const bindTicket = useCallback(async (newTicketId: string | null) => {
+     if (!sessionId) return
+     try {
+@@ -365,6 +699,28 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+     setPendingApprovals(prev => prev.filter(r => r.requestId !== requestId))
+   }, [])
+ 
++  const respondToElicitation = useCallback((requestId: string, content: Record<string, unknown>) => {
++    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return false
++    wsRef.current.send(JSON.stringify({
++      type: 'elicitation_response',
++      requestId,
++      action: 'accept',
++      content,
++    }))
++    setMessages(prev => prev.map(msg => {
++      if (msg.role !== 'assistant') return msg
++      const blocks = (msg as any).blocks?.map((block: AssistantBlock) => {
++        if (block.type === 'tool_use' && block.elicitationRequestId === requestId) {
++          return { ...block, elicitationSubmitted: true }
++        }
++        return block
++      })
++      return blocks ? { ...msg, blocks } : msg
++    }))
++    setLatestElicitationRequestId(prev => (prev === requestId ? null : prev))
++    return true
++  }, [])
++
+   const handleChatEvent = useCallback((msg: any) => {
+     // Track thinking state for typing indicator
+     if (msg.type === 'thinking_start') {
+@@ -430,12 +786,20 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+           const last = copy[copy.length - 1]
+           if (last?.role === 'assistant') {
+             const blocks = [...(last as any).blocks]
++            const pendingElicitation = msg.toolName === 'AskUserQuestion'
++              ? pendingElicitationsRef.current.shift()
++              : undefined
+             blocks.push({
+               type: 'tool_use',
+               toolName: msg.toolName,
+               toolId: msg.toolId,
+               input: '',
+               done: false,
++              elicitationRequestId: pendingElicitation?.requestId,
++              elicitationMode: pendingElicitation?.mode || 'form',
++              elicitationMessage: pendingElicitation?.message || '',
++              elicitationRequestedSchema: pendingElicitation?.requestedSchema ?? null,
++              elicitationSubmitted: false,
+             })
+             copy[copy.length - 1] = { ...last, blocks } as any
+           }
+@@ -562,6 +926,46 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+           break
+         }
+ 
++        case 'elicitation_request': {
++          let attached = false
++          for (let mi = copy.length - 1; mi >= 0; mi--) {
++            const m = copy[mi]
++            if (m.role !== 'assistant') continue
++            const blocks = [...(m as any).blocks]
++            let found = false
++            for (let bi = blocks.length - 1; bi >= 0; bi--) {
++              const block = blocks[bi]
++              if (block.type !== 'tool_use' || block.toolName !== 'AskUserQuestion') continue
++              if (block.elicitationRequestId) continue
++              blocks[bi] = {
++                ...block,
++                elicitationRequestId: msg.requestId,
++                elicitationMode: msg.mode || 'form',
++                elicitationMessage: msg.message || '',
++                elicitationRequestedSchema: msg.requestedSchema || null,
++                elicitationSubmitted: false,
++              }
++              copy[mi] = { ...m, blocks } as any
++              found = true
++              attached = true
++              break
++            }
++            if (found) break
++          }
++          if (!attached && msg.requestId) {
++            pendingElicitationsRef.current.push({
++              requestId: msg.requestId,
++              mode: msg.mode || 'form',
++              message: msg.message || '',
++              requestedSchema: msg.requestedSchema || null,
++            })
++          }
++          if (msg.requestId) {
++            setLatestElicitationRequestId(msg.requestId)
++          }
++          break
++        }
++
+         case 'result': {
+           const last = copy[copy.length - 1]
+           if (last?.role === 'assistant') {
+@@ -577,6 +981,11 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+       return copy
+     })
+ 
++    if (msg.type === 'result') {
++      setStatus('idle')
++      setIsThinking(false)
++    }
++
+     scrollToBottom()
+     if (msg.type === 'text_start' || msg.type === 'message_start') {
+       setStatus('running')
+@@ -739,50 +1148,37 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+   // Send message
+   const sendMessage = useCallback(async () => {
+     const text = input.trim()
+-    if ((!text && attachedFiles.length === 0) || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
++    if (!text && attachedFiles.length === 0) return
+ 
+-    // Build file refs for display
+-    const fileMeta: FileRef[] = attachedFiles.map(f => ({
+-      name: f.name,
+-      type: f.type,
+-      previewUrl: f.previewUrl,
+-    }))
+-
+-    // Build files with base64 for server
+-    const filesForServer: FileRef[] = []
+-    for (const af of attachedFiles) {
+-      const base64 = await fileToBase64(af.file)
+-      filesForServer.push({
+-        name: af.name,
+-        type: af.type,
+-        base64,
+-      })
++    if (!sessionId) {
++      if (status === 'connecting') return
++      pendingInitialSendRef.current = { text, files: [...attachedFiles] }
++      setStatus('connecting')
++      setErrorMsg(null)
++      try {
++        const res = await fetch(`${TS_HTTP}/api/sessions/create`, {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ agentName: agent }),
++        })
++        if (!res.ok) throw new Error(`HTTP ${res.status}`)
++        const data = await res.json()
++        onSessionCreated?.({
++          id: data.sessionId,
++          name: data.session?.name || agent,
++          active: data.session?.active ?? false,
++          ts: Date.now(),
++        })
++      } catch {
++        pendingInitialSendRef.current = null
++        setStatus('error')
++        setErrorMsg(`Could not reach terminal-server at ${TS_HTTP}. Is it running?`)
++      }
++      return
+     }
+ 
+-    setMessages(prev => [...prev, {
+-      role: 'user' as const,
+-      text,
+-      files: fileMeta.length > 0 ? fileMeta : undefined,
+-      ts: Date.now(),
+-    }])
+-
+-    setInput('')
+-    setAttachedFiles([])
+-    setStatus('running')
+-    setErrorMsg(null)
+-
+-    wsRef.current.send(JSON.stringify({
+-      type: 'chat_send',
+-      prompt: text,
+-      files: filesForServer.length > 0 ? filesForServer : undefined,
+-    }))
+-
+-    scrollToBottom()
+-    if (inputRef.current) {
+-      inputRef.current.style.height = 'auto'
+-      inputRef.current.focus()
+-    }
+-  }, [input, attachedFiles, scrollToBottom])
++    await performSend(text, attachedFiles)
++  }, [agent, input, attachedFiles, sessionId, status, onSessionCreated, performSend])
+ 
+   // Detect slash-command region from caret position
+   const detectSlash = useCallback((text: string, caret: number) => {
+@@ -990,7 +1386,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+       {/* Pending approval badge */}
+       {pendingApprovals.length > 0 && (
+         <div
+-          className="absolute top-3 z-40 flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[10px] animate-pulse"
++          className="absolute top-3 z-40 flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[10px] shadow-sm"
+           style={{
+             right: sessionId ? '12px' : '12px',
+             background: '#F59E0B15',
+@@ -999,7 +1395,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+           }}
+         >
+           <ShieldAlert size={11} />
+-          <span>{pendingApprovals.length === 1 ? 'Awaiting your approval' : `${pendingApprovals.length} awaiting approval`}</span>
++          <span>{pendingApprovals.length === 1 ? 'Approval required' : `${pendingApprovals.length} approvals required`}</span>
+         </div>
+       )}
+ 
+@@ -1019,13 +1415,13 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+             <Upload size={24} style={{ color: accentColor }} />
+           </div>
+           <p className="text-sm font-medium" style={{ color: accentColor }}>
+-            Solte os arquivos aqui
++            Drop files here
+           </p>
+         </div>
+       )}
+ 
+       {/* Messages area */}
+-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
++      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6 pb-24 space-y-5">
+         {messages.length === 0 && (
+           <div className="flex flex-col items-center justify-center h-full text-center">
+             <div
+@@ -1157,7 +1553,19 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+                         </div>
+                       )}
+                       {block.type === 'tool_use' && (
+-                        <ToolCard block={block} accentColor={accentColor} />
++                        <ToolCard
++                          block={block}
++                          accentColor={accentColor}
++                          fallbackElicitationRequestId={latestElicitationRequestId}
++                          resolveFallbackElicitationRequestId={() => {
++                            const pendingTail = pendingElicitationsRef.current[pendingElicitationsRef.current.length - 1]
++                            return latestElicitationRequestIdRef.current || pendingTail?.requestId || null
++                          }}
++                          onSubmitElicitation={async (requestId, content) => {
++                            return respondToElicitation(requestId, content)
++                          }}
++                          onSendPrompt={(prompt) => performSend(prompt, [])}
++                        />
+                       )}
+                     </div>
+                   ))}
+@@ -1206,13 +1614,15 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+           />
+         ))}
+ 
+-        {/* Global thinking indicator when running but no assistant message yet */}
++        {/* Global neutral indicator while the assistant has not emitted a visible block yet */}
+         {status === 'running' && messages[messages.length - 1]?.role !== 'assistant' && (
+           <div className="flex gap-3">
+             <div className="flex-shrink-0 mt-0.5">
+               <AgentAvatar name={agent} size={28} />
+             </div>
+-            <TypingIndicator accentColor={accentColor} isThinking />
++            <div>
++              <TypingIndicator accentColor={accentColor} isThinking={isThinking} />
++            </div>
+           </div>
+         )}
+       </div>
+@@ -1308,7 +1718,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+             <button
+               onClick={() => fileInputRef.current?.click()}
+               className="flex-shrink-0 flex items-center justify-center w-7 h-7 rounded-lg text-[#667085] hover:text-[#e6edf3] hover:bg-[#21262d] transition-colors mb-0.5"
+-              title="Anexar arquivo"
++              title="Attach file"
+             >
+               <Paperclip size={14} />
+             </button>
+@@ -1389,8 +1799,9 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
+ // ── Sub-components ──
+ 
+ function TypingIndicator({ accentColor, isThinking }: { accentColor: string; isThinking?: boolean }) {
++  void isThinking
+   return (
+-    <div className="flex items-center gap-2 py-1">
++    <div className="flex items-center py-1">
+       <div className="flex items-center gap-1">
+         {[0, 1, 2].map((i) => (
+           <span
+@@ -1404,12 +1815,6 @@ function TypingIndicator({ accentColor, isThinking }: { accentColor: string; isT
+           />
+         ))}
+       </div>
+-      <span
+-        className="text-[10px] text-[#667085]"
+-        style={{ animation: 'chat-pulse 2s ease-in-out infinite' }}
+-      >
+-        {isThinking ? 'Thinking...' : 'Typing...'}
+-      </span>
+     </div>
+   )
+ }
+@@ -1423,7 +1828,7 @@ function AgentInputToggle({ parsedInput, rawInput }: { parsedInput: any; rawInpu
+         className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] text-[#667085] hover:text-[#8b949e] transition-colors w-full"
+       >
+         {showInput ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+-        View input
++        Input
+       </button>
+       {showInput && (
+         <pre className="px-3 pb-2 text-[11px] text-[#8b949e] font-mono whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+@@ -1434,30 +1839,32 @@ function AgentInputToggle({ parsedInput, rawInput }: { parsedInput: any; rawInpu
+   )
+ }
+ 
+-function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { type: 'tool_use' }>; accentColor: string }) {
++function ToolCard({ block, accentColor, onSubmitElicitation, onSendPrompt, fallbackElicitationRequestId, resolveFallbackElicitationRequestId }: { block: Extract<AssistantBlock, { type: 'tool_use' }>; accentColor: string; onSubmitElicitation?: (requestId: string, content: Record<string, unknown>) => Promise<boolean> | boolean; onSendPrompt?: (prompt: string) => Promise<void> | void; fallbackElicitationRequestId?: string | null; resolveFallbackElicitationRequestId?: () => string | null }) {
++  const normalizedBlock = normalizeAssistantBlock(block) as Extract<AssistantBlock, { type: 'tool_use' }>
+   const [open, setOpen] = useState(false)
++  const [askAnswers, setAskAnswers] = useState<Record<number, string[]>>({})
++  const [askOtherText, setAskOtherText] = useState<Record<number, string>>({})
++  const [sendingAskAnswers, setSendingAskAnswers] = useState(false)
++  const [askFallbackSubmitted, setAskFallbackSubmitted] = useState(false)
+ 
+   let parsedInput: any = null
+-  try { parsedInput = JSON.parse(block.input) } catch {}
++  if (typeof normalizedBlock.input === 'string') {
++    try { parsedInput = JSON.parse(normalizedBlock.input) } catch {}
++  } else if (normalizedBlock.input && typeof normalizedBlock.input === 'object') {
++    parsedInput = normalizedBlock.input
++  }
+ 
+   // Detect Agent/SendMessage tools — render special subagent card
+-  const isAgentTool = block.toolName === 'Agent' || block.toolName === 'SendMessage'
+-  const subagentName = parsedInput?.subagent_type || parsedInput?.name || parsedInput?.to || ''
+-  const subagentDesc = parsedInput?.description || parsedInput?.summary || block.subagentType || ''
++  const isAgentTool = normalizedBlock.toolName === 'Agent' || normalizedBlock.toolName === 'SendMessage'
++  const subagentName = safeText(parsedInput?.subagent_type || parsedInput?.name || parsedInput?.to || '')
+ 
+   if (isAgentTool) {
+-    const isRunning = block.subagentStatus === 'running'
+-    const isDone = block.done || block.subagentStatus === 'completed' || block.subagentStatus === 'failed'
+-    const subagentTools = block.subagentTools || []
++    const isRunning = normalizedBlock.subagentStatus === 'running'
++    const isDone = normalizedBlock.done || normalizedBlock.subagentStatus === 'completed' || normalizedBlock.subagentStatus === 'failed'
++    const isFailed = normalizedBlock.subagentStatus === 'failed'
++    const subagentTools = normalizedBlock.subagentTools || []
+     const toolCount = subagentTools.length
+ 
+-    const getToolIcon = (toolName: string) => {
+-      if (toolName === 'Bash') return <TermIcon size={11} className="text-[#667085] flex-shrink-0" />
+-      if (toolName === 'Read') return <FileText size={11} className="text-[#667085] flex-shrink-0" />
+-      if (toolName === 'Edit' || toolName === 'Write') return <Edit2 size={11} className="text-[#667085] flex-shrink-0" />
+-      return <FileCode size={11} className="text-[#667085] flex-shrink-0" />
+-    }
+-
+     return (
+       <div className="border border-[#21262d] rounded-lg overflow-hidden">
+         <button
+@@ -1473,59 +1880,51 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
+             return displayName ? (
+               <AgentAvatar name={displayName.replace('custom-', '')} size={20} />
+             ) : (
+-              <FileCode size={13} style={{ color: accentColor }} />
++              getToolIcon(normalizedBlock.toolName, accentColor)
+             )
+           })()}
+ 
+           <span className="font-medium text-[#e6edf3]">
+             {(() => {
+               const isUuid = /^[0-9a-f]{8,}$/i.test(subagentName)
+-              return isUuid ? (block.toolName === 'SendMessage' ? 'SendMessage' : 'Agent') : subagentName ? `@${subagentName}` : block.toolName
++              return isUuid ? getToolLabel(normalizedBlock.toolName) : subagentName ? `@${subagentName}` : getToolLabel(normalizedBlock.toolName)
+             })()}
+           </span>
+-          {subagentDesc && (
+-            <span className="text-[#8b949e] truncate max-w-[300px] text-[11px]">{subagentDesc}</span>
+-          )}
+ 
+           <span className="ml-auto flex-shrink-0 flex items-center gap-2">
+-            {/* Tool count badge */}
+             {toolCount > 0 && (
+               <span className="text-[10px] text-[#667085] tabular-nums">
+                 {toolCount} {toolCount === 1 ? 'tool' : 'tools'}
+               </span>
+             )}
+-            {/* Progress summary */}
+             {isRunning && block.subagentSummary && (
+               <span className="text-[10px] text-[#667085] truncate max-w-[200px]" style={{ animation: 'chat-pulse 2s ease-in-out infinite' }}>
+                 {block.subagentSummary}
+               </span>
+             )}
+-            {isDone ? (
+-              <CheckCircle2 size={13} className={block.subagentStatus === 'failed' ? 'text-[#ef4444]' : 'text-[#22C55E]'} />
+-            ) : (
+-              <TypingIndicatorMini accentColor={accentColor} />
+-            )}
++            {isDone
++              ? <ToolStateBadge state={isFailed ? 'failed' : 'done'} accentColor={accentColor} />
++              : <ToolStateBadge state="running" accentColor={accentColor} />}
+           </span>
+         </button>
+         {open && (
+           <div className="border-t border-[#21262d] bg-[#0d1117]">
+-            {/* Tool list */}
+             <div className="max-h-80 overflow-y-auto">
+               {subagentTools.length === 0 ? (
+-                <div className="px-3 py-2 text-[11px] text-[#667085]">No tools yet</div>
++                <div className="px-3 py-2 text-[11px] text-[#667085]">No tool calls yet</div>
+               ) : (
+                 subagentTools.map((t, i) => {
+-                  let inputPreview = ''
++                  let parsedToolInput: any = null
+                   try {
+-                    const parsed = JSON.parse(t.input)
+-                    inputPreview = (parsed.command || parsed.file_path || parsed.path || parsed.pattern || parsed.description || t.input).slice(0, 60)
++                    parsedToolInput = JSON.parse(t.input)
+                   } catch {
+-                    inputPreview = t.input.slice(0, 60)
++                    parsedToolInput = null
+                   }
++                  const inputPreview = summarizeToolInput(t.toolName, parsedToolInput, t.input).slice(0, 80)
+                   return (
+                     <div key={t.toolUseId || i} className="flex items-center gap-2 px-3 py-1.5 text-[11px] border-t border-[#21262d]/50 first:border-t-0">
+-                      {getToolIcon(t.toolName)}
+-                      <span className="text-[#8b949e] font-medium flex-shrink-0">{t.toolName}</span>
++                      {getToolIcon(t.toolName, accentColor, 11, 'text-[#667085] flex-shrink-0')}
++                      <span className="text-[#8b949e] font-medium flex-shrink-0">{getToolLabel(t.toolName)}</span>
+                       {inputPreview && (
+                         <span className="text-[#667085] truncate">{inputPreview}</span>
+                       )}
+@@ -1534,8 +1933,7 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
+                 })
+               )}
+             </div>
+-            {/* Collapsible raw input */}
+-            {block.input && <AgentInputToggle parsedInput={parsedInput} rawInput={block.input} />}
++            {normalizedBlock.input && <AgentInputToggle parsedInput={parsedInput} rawInput={safeText(normalizedBlock.input)} />}
+           </div>
+         )}
+       </div>
+@@ -1543,7 +1941,7 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
+   }
+ 
+   // TodoWrite — pretty checklist renderer
+-  if (block.toolName === 'TodoWrite' && Array.isArray(parsedInput?.todos)) {
++  if (normalizedBlock.toolName === 'TodoWrite' && Array.isArray(parsedInput?.todos)) {
+     const todos: Array<{ content: string; status: string; priority?: string; id?: string }> = parsedInput.todos
+     const completedCount = todos.filter(t => t.status === 'completed').length
+ 
+@@ -1558,11 +1956,9 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
+           <span className="font-medium text-[#e6edf3]">TodoWrite</span>
+           <span className="text-[#667085] text-[11px]">{completedCount}/{todos.length} done</span>
+           <span className="ml-auto flex-shrink-0">
+-            {block.done ? (
+-              <CheckCircle2 size={13} className="text-[#22C55E]" />
+-            ) : (
+-              <TypingIndicatorMini accentColor={accentColor} />
+-            )}
++            {normalizedBlock.done
++              ? <ToolStateBadge state="done" accentColor={accentColor} />
++              : <ToolStateBadge state="running" accentColor={accentColor} />}
+           </span>
+         </button>
+         <div className="px-3 py-2 border-t border-[#21262d] bg-[#0d1117] space-y-1">
+@@ -1593,35 +1989,267 @@ function ToolCard({ block, accentColor }: { block: Extract<AssistantBlock, { typ
+     )
+   }
+ 
++  if (normalizedBlock.toolName === 'AskUserQuestion' && Array.isArray(parsedInput?.questions)) {
++    const questions: Array<{ question?: string; header?: string; options?: Array<{ label?: string; description?: string }>; multiSelect?: boolean }> = parsedInput.questions
++    const schemaPropertyKeys = (() => {
++      const schema = normalizedBlock.elicitationRequestedSchema as any
++      if (!schema || typeof schema !== 'object') return [] as string[]
++      if (!schema.properties || typeof schema.properties !== 'object') return [] as string[]
++      return Object.keys(schema.properties)
++    })()
++    const totalOptions = questions.reduce((acc, q) => acc + (Array.isArray(q.options) ? q.options.length : 0), 0)
++    const OTHER_SENTINEL = '__other__'
++    const hasSubmittedAsk = normalizedBlock.elicitationSubmitted || askFallbackSubmitted
++    const isAskLocked = hasSubmittedAsk || sendingAskAnswers
++    const allAnswered = questions.every((q, idx) => {
++      if (!q.question) return true
++      const selected = Array.isArray(askAnswers[idx]) ? askAnswers[idx] : []
++      if (selected.includes(OTHER_SENTINEL)) {
++        return (askOtherText[idx] || '').trim().length > 0
++      }
++      return selected.length > 0
++    })
++    const canSubmitStructured = !hasSubmittedAsk && !!onSubmitElicitation
++
++    const toggleAnswer = (questionIdx: number, optionLabel: string, multiSelect?: boolean) => {
++      setAskAnswers(prev => {
++        const current = prev[questionIdx] || []
++        if (!multiSelect) {
++          return { ...prev, [questionIdx]: [optionLabel] }
++        }
++        const next = current.includes(optionLabel)
++          ? current.filter(v => v !== optionLabel)
++          : [...current, optionLabel]
++        return { ...prev, [questionIdx]: next }
++      })
++    }
++
++    const submitAnswers = async () => {
++      const requestIdForSubmit = normalizedBlock.elicitationRequestId
++        || resolveFallbackElicitationRequestId?.()
++        || fallbackElicitationRequestId
++        || null
++      if (sendingAskAnswers || !allAnswered || isAskLocked) return
++      const content = questions.reduce<Record<string, unknown>>((acc, q: any, idx) => {
++        const selected = askAnswers[idx] || []
++        const otherText = (askOtherText[idx] || '').trim()
++        const selectedWithoutOther = selected.filter(v => v !== OTHER_SENTINEL)
++        const key = schemaPropertyKeys[idx]
++          || (typeof q?.id === 'string' && q.id.trim()
++          ? q.id.trim()
++          : (q.question || `question_${idx + 1}`))
++        if (q.multiSelect) {
++          acc[key] = otherText ? [...selectedWithoutOther, otherText] : selectedWithoutOther
++        } else {
++          acc[key] = otherText || selectedWithoutOther[0] || ''
++        }
++        return acc
++      }, {})
++      const fallbackPrompt = [
++        'Aqui estao minhas respostas para as perguntas estruturadas:',
++        ...questions.map((q: any, idx) => {
++          const selected = askAnswers[idx] || []
++          const otherText = (askOtherText[idx] || '').trim()
++          const selectedWithoutOther = selected.filter(v => v !== OTHER_SENTINEL)
++          const answer = q.multiSelect
++            ? (otherText ? [...selectedWithoutOther, otherText] : selectedWithoutOther).join(', ')
++            : (otherText || selectedWithoutOther[0] || '')
++          return `- ${q.question || `Question ${idx + 1}`}: ${answer}`
++        }),
++      ].join('\n')
++      try {
++        setSendingAskAnswers(true)
++        if (canSubmitStructured && requestIdForSubmit && onSubmitElicitation) {
++          const submitted = await onSubmitElicitation(requestIdForSubmit, content)
++          if (submitted) return
++        }
++        if (onSendPrompt) {
++          await onSendPrompt(fallbackPrompt)
++          setAskFallbackSubmitted(true)
++        }
++      } finally {
++        setSendingAskAnswers(false)
++      }
++    }
++
++    return (
++      <div className="relative z-10 border border-[#21262d] rounded-lg overflow-hidden pointer-events-auto">
++        <button
++          onClick={() => setOpen(!open)}
++          className="flex items-center gap-2 w-full px-3 py-2 text-[12px] bg-[#161b22] hover:bg-[#1c2333] transition-colors"
++        >
++          {open ? <ChevronDown size={12} className="text-[#667085]" /> : <ChevronRight size={12} className="text-[#667085]" />}
++          <ShieldAlert size={13} style={{ color: accentColor }} />
++          <span className="font-medium text-[#e6edf3]">AskUserQuestion</span>
++          <span className="text-[#667085] text-[11px]">
++            {questions.length} question{questions.length !== 1 ? 's' : ''}{totalOptions ? ` • ${totalOptions} options` : ''}
++          </span>
++          <span className="ml-auto flex-shrink-0">
++              {hasSubmittedAsk
++              ? <ToolStateBadge state="done" accentColor={accentColor} />
++              : <ToolStateBadge state="needs_input" accentColor={accentColor} />}
++          </span>
++        </button>
++        {open && (
++          <div className="relative z-10 px-3 py-3 border-t border-[#21262d] bg-[#0d1117] space-y-3 pointer-events-auto">
++            {questions.map((q, idx) => (
++              <div key={idx} className="rounded-lg border border-[#21262d] bg-[#11161d] p-3">
++                <div className="flex items-center gap-2 mb-2">
++                  {q.header && (
++                    <span className="text-[10px] uppercase tracking-wide rounded-full px-2 py-0.5 border border-[#2b3442] text-[#8b949e]">
++                      {q.header}
++                    </span>
++                  )}
++                </div>
++                <p className="text-[12px] text-[#e6edf3] font-medium mb-2">{q.question || `Question ${idx + 1}`}</p>
++                {Array.isArray(q.options) && q.options.length > 0 && (
++                  <div className="space-y-1.5">
++                    {q.options.map((opt, optIdx) => {
++                      const optionLabel = opt.label || `Option ${optIdx + 1}`
++                      const selected = (askAnswers[idx] || []).includes(optionLabel)
++                      return (
++                        <button
++                          key={optIdx}
++                          type="button"
++                          onClick={() => toggleAnswer(idx, optionLabel, q.multiSelect)}
++                          className="w-full text-left rounded-md border px-2.5 py-2 transition-colors"
++                          style={{
++                            borderColor: selected ? `${accentColor}66` : '#21262d',
++                            background: selected ? `${accentColor}12` : '#0d1117',
++                          }}
++                          disabled={isAskLocked}
++                        >
++                          <div className="text-[11px] text-[#e6edf3]">{optionLabel}</div>
++                          {opt.description && (
++                            <div className="text-[10px] text-[#667085] mt-0.5">{opt.description}</div>
++                          )}
++                        </button>
++                      )
++                    })}
++                    {(() => {
++                      const selected = (askAnswers[idx] || []).includes(OTHER_SENTINEL)
++                      return (
++                        <div className="rounded-md border px-2.5 py-2" style={{ borderColor: selected ? `${accentColor}66` : '#21262d', background: selected ? `${accentColor}12` : '#0d1117' }}>
++                          <button
++                            type="button"
++                            onClick={() => toggleAnswer(idx, OTHER_SENTINEL, q.multiSelect)}
++                            className="w-full text-left"
++                            disabled={isAskLocked}
++                          >
++                            <div className="text-[11px] text-[#e6edf3]">Other</div>
++                            <div className="text-[10px] text-[#667085] mt-0.5">Provide a custom text answer.</div>
++                          </button>
++                          {selected && (
++                            <input
++                              type="text"
++                              value={askOtherText[idx] || ''}
++                              onChange={(e) => setAskOtherText(prev => ({ ...prev, [idx]: e.target.value }))}
++                              placeholder="Type your answer"
++                              className="mt-2 w-full rounded-md border border-[#21262d] bg-[#11161d] px-2.5 py-2 text-[11px] text-[#e6edf3] placeholder:text-[#667085] outline-none"
++                              disabled={isAskLocked}
++                            />
++                          )}
++                        </div>
++                      )
++                    })()}
++                  </div>
++                )}
++              </div>
++            ))}
++            <div className="relative z-20 flex items-center justify-between gap-3 pt-2 pointer-events-auto">
++              <button
++                type="button"
++                onClick={(e) => {
++                  e.preventDefault()
++                  e.stopPropagation()
++                  if (!allAnswered || isAskLocked) return
++                  void submitAnswers()
++                }}
++                disabled={!allAnswered || isAskLocked}
++                className="relative z-30 min-w-[96px] px-3 py-2 rounded-md text-[11px] font-medium pointer-events-auto disabled:opacity-50 disabled:cursor-not-allowed"
++                style={{ background: `${accentColor}20`, color: accentColor, border: `1px solid ${accentColor}40` }}
++              >
++                {hasSubmittedAsk ? 'Done' : sendingAskAnswers ? 'Sending...' : 'Submit'}
++              </button>
++            </div>
++          </div>
++        )}
++      </div>
++    )
++  }
++
+   // Regular tool card
+-  const displayInfo = parsedInput
+-    ? (parsedInput.command || parsedInput.file_path || parsedInput.path || parsedInput.pattern || parsedInput.description || '')
+-    : ''
++  const displayInfo = summarizeToolInput(normalizedBlock.toolName, parsedInput, safeText(normalizedBlock.input)).slice(0, 140)
++  const detailRows = getToolDetailRows(normalizedBlock.toolName, parsedInput)
++  const isFileTool = normalizedBlock.toolName === 'Read' || normalizedBlock.toolName === 'Write' || normalizedBlock.toolName === 'Edit'
++  const isTerminalTool = normalizedBlock.toolName === 'Bash'
+ 
+   return (
+     <div className="border border-[#21262d] rounded-lg overflow-hidden">
+       <button
+         onClick={() => setOpen(!open)}
+-        className="flex items-center gap-2 w-full px-3 py-2 text-[12px] bg-[#161b22] hover:bg-[#1c2333] transition-colors"
++        className="flex items-start gap-2 w-full px-3 py-2 text-[12px] bg-[#161b22] hover:bg-[#1c2333] transition-colors"
+       >
+-        {open ? <ChevronDown size={12} className="text-[#667085]" /> : <ChevronRight size={12} className="text-[#667085]" />}
+-        <FileCode size={13} style={{ color: accentColor }} />
+-        <span className="font-medium text-[#e6edf3]">{block.toolName}</span>
+-        {displayInfo && (
+-          <span className="text-[#667085] truncate max-w-[300px] text-[11px] font-mono">{displayInfo}</span>
+-        )}
+-        <span className="ml-auto flex-shrink-0">
+-          {block.done ? (
+-            <CheckCircle2 size={13} className="text-[#22C55E]" />
+-          ) : (
+-            <TypingIndicatorMini accentColor={accentColor} />
++        <span className="mt-0.5">
++          {open ? <ChevronDown size={12} className="text-[#667085]" /> : <ChevronRight size={12} className="text-[#667085]" />}
++        </span>
++        <span className="mt-0.5">
++          {getToolIcon(normalizedBlock.toolName, accentColor)}
++        </span>
++        <span className="min-w-0 flex-1 text-left">
++          <span className="flex items-center gap-2 flex-wrap">
++            <span className="font-medium text-[#e6edf3]">{getToolLabel(normalizedBlock.toolName)}</span>
++            {detailRows.chips.length > 0 && (
++              <span className="flex items-center gap-1 flex-wrap">
++                {detailRows.chips.map((chip, index) => (
++                  <span
++                    key={`${chip}-${index}`}
++                    className="rounded-full border px-1.5 py-0.5 text-[10px]"
++                    style={{
++                      borderColor: isTerminalTool ? `${accentColor}35` : isFileTool ? '#2b3442' : '#21262d',
++                      background: isTerminalTool ? `${accentColor}10` : '#0d1117',
++                      color: isTerminalTool ? accentColor : '#8b949e',
++                    }}
++                  >
++                    {chip}
++                  </span>
++                ))}
++              </span>
++            )}
++          </span>
++          {detailRows.primary && (
++            <span className={`block truncate max-w-[440px] text-[11px] mt-0.5 ${isFileTool || isTerminalTool ? 'font-mono' : ''}`} style={{ color: isFileTool ? '#c9d1d9' : '#8b949e' }}>
++              {detailRows.primary}
++            </span>
++          )}
++          {detailRows.secondary && (
++            <span className="block truncate max-w-[440px] text-[10px] mt-0.5 text-[#667085]">
++              {detailRows.secondary}
++            </span>
+           )}
++          {!detailRows.primary && displayInfo && (
++            <span className="block truncate max-w-[440px] text-[11px] mt-0.5 text-[#667085]">
++              {displayInfo}
++            </span>
++          )}
++        </span>
++        <span className="ml-auto flex-shrink-0 mt-0.5">
++          {normalizedBlock.done
++            ? <ToolStateBadge state="done" accentColor={accentColor} />
++            : <ToolStateBadge state="running" accentColor={accentColor} />}
+         </span>
+       </button>
+-      {open && block.input && (
++      {open && normalizedBlock.input && (
+         <div className="px-3 py-2 border-t border-[#21262d] bg-[#0d1117]">
++          {(isFileTool || isTerminalTool) && detailRows.primary && (
++            <div className="mb-2 rounded-md border border-[#21262d] bg-[#11161d] px-2.5 py-2">
++              <div className="text-[11px] font-mono text-[#c9d1d9] break-all">
++                {detailRows.primary}
++              </div>
++            </div>
++          )}
+           <pre className="text-[11px] text-[#8b949e] font-mono whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+-            {parsedInput ? JSON.stringify(parsedInput, null, 2) : block.input}
++            {parsedInput ? JSON.stringify(parsedInput, null, 2) : safeText(normalizedBlock.input)}
+           </pre>
+         </div>
+       )}
+@@ -1636,6 +2264,57 @@ interface ApprovalCardProps {
+   onDeny: () => void
+ }
+ 
++function summarizeApproval(req: PermissionRequest) {
++  const inp = req.input as any
++
++  if (req.toolName === 'Bash') {
++    const command = inp?.command ? String(inp.command).replace(/\s+/g, ' ').trim() : ''
++    return {
++      summary: command.slice(0, 140),
++      detail: req.description,
++    }
++  }
++
++  if (req.toolName === 'Write') {
++    const filePath = inp?.file_path ? String(inp.file_path) : ''
++    return {
++      summary: filePath,
++      detail: req.description,
++    }
++  }
++
++  if (req.toolName === 'Edit') {
++    const filePath = inp?.file_path ? String(inp.file_path) : ''
++    return {
++      summary: filePath,
++      detail: req.description,
++    }
++  }
++
++  if (req.toolName === 'Agent') {
++    const agentName = inp?.subagent_type || inp?.agent || ''
++    const prompt = inp?.prompt || inp?.description || ''
++    return {
++      summary: agentName ? `@${agentName}` : String(prompt).slice(0, 100),
++      detail: req.description,
++    }
++  }
++
++  if (req.toolName === 'AskUserQuestion') {
++    const questions = Array.isArray(inp?.questions) ? inp.questions : []
++    const firstQuestion = questions[0]?.question ? String(questions[0].question) : ''
++    return {
++      summary: questions.length > 0 ? `${questions.length} question${questions.length > 1 ? 's' : ''}` : '',
++      detail: firstQuestion || req.description,
++    }
++  }
++
++  return {
++    summary: req.title || '',
++    detail: req.description,
++  }
++}
++
+ function ApprovalCard({ req, accentColor, onAllow, onDeny }: ApprovalCardProps) {
+   let summary = ''
+   const inp = req.input as any
+@@ -1652,6 +2331,7 @@ function ApprovalCard({ req, accentColor, onAllow, onDeny }: ApprovalCardProps)
+     summary = agentName ? `@${agentName}${prompt ? ' — ' + String(prompt).slice(0, 80) : ''}` : String(prompt).slice(0, 100)
+   }
+   if (!summary && req.title) summary = req.title
++  const { summary: friendlySummary, detail } = summarizeApproval(req)
+ 
+   return (
+     <div
+@@ -1660,14 +2340,14 @@ function ApprovalCard({ req, accentColor, onAllow, onDeny }: ApprovalCardProps)
+     >
+       <ShieldAlert size={14} className="flex-shrink-0 mt-0.5" style={{ color: '#F59E0B' }} />
+       <div className="flex-1 min-w-0">
+-        <div className="flex items-center gap-2 mb-0.5">
+-          <span className="text-[11px] font-semibold text-[#e6edf3]">{req.toolName}</span>
+-          {summary && (
+-            <span className="text-[10px] text-[#8b949e] font-mono truncate max-w-[260px]">{summary}</span>
++        <div className="flex items-center gap-2 mb-0.5 flex-wrap">
++          <span className="text-[11px] font-semibold text-[#e6edf3]">{getToolLabel(req.toolName)}</span>
++          {(friendlySummary || summary) && (
++            <span className="text-[10px] text-[#8b949e] truncate max-w-[320px]">{friendlySummary || summary}</span>
+           )}
+         </div>
+-        {req.description && (
+-          <p className="text-[10px] text-[#667085] truncate">{req.description}</p>
++        {(detail || req.description) && (
++          <p className="text-[10px] text-[#667085] line-clamp-2">{detail || req.description}</p>
+         )}
+       </div>
+       <div className="flex items-center gap-1.5 flex-shrink-0">
+@@ -1711,5 +2391,52 @@ function TypingIndicatorMini({ accentColor }: { accentColor: string }) {
+   )
+ }
+ 
++function ToolStateBadge({
++  state,
++  accentColor,
++  label,
++}: {
++  state: 'running' | 'done' | 'needs_input' | 'failed'
++  accentColor: string
++  label?: string
++}) {
++  if (state === 'running') {
++    return (
++      <span
++        className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium"
++        style={{ color: accentColor, borderColor: `${accentColor}40`, background: `${accentColor}12` }}
++      >
++        <TypingIndicatorMini accentColor={accentColor} />
++        {label ? <span>{label}</span> : null}
++      </span>
++    )
++  }
++
++  if (state === 'needs_input') {
++    return (
++      <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium border-[#F59E0B40] bg-[#F59E0B12] text-[#F59E0B]">
++        <ShieldAlert size={10} />
++        {label ? <span>{label}</span> : null}
++      </span>
++    )
++  }
++
++  if (state === 'failed') {
++    return (
++      <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium border-[#ef444440] bg-[#ef444412] text-[#ef4444]">
++        <Ban size={10} />
++        <span>{label || 'Failed'}</span>
++      </span>
++    )
++  }
++
++  return (
++    <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium border-[#22C55E40] bg-[#22C55E12] text-[#22C55E]">
++      <CheckCircle2 size={10} />
++      {label ? <span>{label}</span> : null}
++    </span>
++  )
++}
++
+ // Suppress unused import warning
+ void ImageIcon
+diff --git a/dashboard/frontend/src/lib/api.ts b/dashboard/frontend/src/lib/api.ts
+index 0dc2bc0..42d04ef 100644
+--- a/dashboard/frontend/src/lib/api.ts
++++ b/dashboard/frontend/src/lib/api.ts
+@@ -2,12 +2,18 @@ const API = import.meta.env.DEV ? 'http://localhost:8080' : '';
+ 
+ export const api = {
+   get: async (path: string) => {
+-    const res = await fetch(`${API}/api${path}`, { credentials: 'include' });
++    const res = await fetch(`${API}/api${path}`, {
++      credentials: 'include',
++      cache: 'no-store',
++    });
+     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+     return res.json();
+   },
+   getRaw: async (path: string) => {
+-    const res = await fetch(`${API}/api${path}`, { credentials: 'include' });
++    const res = await fetch(`${API}/api${path}`, {
++      credentials: 'include',
++      cache: 'no-store',
++    });
+     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+     return res.text();
+   },
+diff --git a/dashboard/frontend/src/pages/AgentDetail.tsx b/dashboard/frontend/src/pages/AgentDetail.tsx
+index 8454cf7..12f1db6 100644
+--- a/dashboard/frontend/src/pages/AgentDetail.tsx
++++ b/dashboard/frontend/src/pages/AgentDetail.tsx
+@@ -26,6 +26,10 @@ const TS_HTTP = isLocal
+   ? `http://${window.location.hostname}:32352`
+   : `${window.location.origin}/terminal`
+ 
++function buildNativeSessionName(agentName: string) {
++  return `${agentName} — ${new Date().toLocaleString()}`
++}
++
+ interface TerminalTab {
+   id: string       // sessionId
+   name: string     // display name
+@@ -144,7 +148,7 @@ export default function AgentDetail() {
+       const data = await res.json()
+       const newTab: TerminalTab = {
+         id: data.sessionId,
+-        name: data.session?.name || `${name} #${termTabs.length + 1}`,
++        name: data.session?.name || buildNativeSessionName(name),
+         active: false,
+       }
+       // If this is the first extra tab, we also need to load the existing default session
+@@ -189,7 +193,8 @@ export default function AgentDetail() {
+         if (prev && sessions.some(s => s.id === prev)) return prev
+         return sessions.length > 0 ? sessions[0].id : null
+       })
+-    } catch {}
++    } catch {
++    }
+   }, [name])
+ 
+   useEffect(() => {
+@@ -208,14 +213,37 @@ export default function AgentDetail() {
+       const data = await res.json()
+       const newSession: ChatSession = {
+         id: data.sessionId,
+-        name: data.session?.name || `${name} #${chatSessions.length + 1}`,
++        name: data.session?.name || buildNativeSessionName(name),
+         active: false,
+         ts: Date.now(),
+       }
+       setChatSessions(prev => [newSession, ...prev])
+       setActiveChatSessionId(data.sessionId)
+     } catch {}
+-  }, [name, chatSessions])
++  }, [name])
++
++  const handleChatSessionCreated = useCallback((session: ChatSession) => {
++    setChatSessions(prev => {
++      if (prev.some(existing => existing.id === session.id)) {
++        return prev
++      }
++      return [session, ...prev]
++    })
++    setActiveChatSessionId(session.id)
++    setChatConnectError(null)
++    setChatConnecting(false)
++  }, [])
++
++  const handleChatSessionMetaChange = useCallback((sessionId: string, patch: Partial<ChatSession>) => {
++    setChatSessions(prev => {
++      const index = prev.findIndex(session => session.id === sessionId)
++      if (index < 0) return prev
++      const next = [...prev]
++      next[index] = { ...next[index], ...patch }
++      next.sort((a, b) => (b.ts || 0) - (a.ts || 0))
++      return next
++    })
++  }, [])
+ 
+   const selectChatSession = useCallback((id: string) => {
+     setActiveChatSessionId(id)
+@@ -248,7 +276,9 @@ export default function AgentDetail() {
+   const deleteChatSession = useCallback(async (id: string) => {
+     try {
+       await fetch(`${TS_HTTP}/api/sessions/${id}`, { method: 'DELETE' })
+-      setChatSessions(prev => prev.filter(s => s.id !== id))
++      setChatSessions(prev => {
++        return prev.filter(s => s.id !== id)
++      })
+       setActiveChatSessionId(prev => {
+         if (prev !== id) return prev
+         const remaining = chatSessions.filter(s => s.id !== id && !s.archived)
+@@ -257,41 +287,6 @@ export default function AgentDetail() {
+     } catch {}
+   }, [chatSessions])
+ 
+-  // Auto-create a chat session when switching to chat mode if none exist
+-  useEffect(() => {
+-    if (viewMode === 'chat' && chatSessions.length === 0 && name) {
+-      setChatConnectError(null)
+-      setChatConnecting(true)
+-      // Find-or-create via the for-agent endpoint
+-      fetch(`${TS_HTTP}/api/sessions/for-agent`, {
+-        method: 'POST',
+-        headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({ agentName: name }),
+-      })
+-        .then(r => {
+-          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+-          return r.json()
+-        })
+-        .then(data => {
+-          if (!data) return
+-          const session: ChatSession = {
+-            id: data.sessionId,
+-            name: data.session?.name || name,
+-            active: data.session?.active ?? false,
+-            ts: Date.now(),
+-          }
+-          setChatSessions([session])
+-          setActiveChatSessionId(data.sessionId)
+-        })
+-        .catch(() => {
+-          setChatConnectError(`Could not reach terminal-server at ${TS_HTTP}. Is it running?`)
+-        })
+-        .finally(() => {
+-          setChatConnecting(false)
+-        })
+-    }
+-  }, [viewMode, chatSessions.length, name])
+-
+   const closeTerminalTab = useCallback(async (sessionId: string) => {
+     // Stop and delete session
+     try {
+@@ -383,6 +378,7 @@ export default function AgentDetail() {
+ 
+   const profileBody = extractProfileBody(content)
+   const profileLead = extractProfileLead(content)
++  const supportsPersistentMemory = !/no persistent agent memory/i.test(content)
+ 
+   return (
+     <div className="flex h-full w-full flex-col bg-[#0C111D]">
+@@ -421,7 +417,9 @@ export default function AgentDetail() {
+         {/* Memory count — right aligned */}
+         <div className="ml-auto flex items-center gap-4">
+           <span className="hidden sm:inline text-[10px] uppercase tracking-[0.12em] text-[#667085]">
+-            {memories.length} {memories.length === 1 ? 'memory' : 'memories'}
++            {supportsPersistentMemory
++              ? `${memories.length} ${memories.length === 1 ? 'memory' : 'memories'}`
++              : 'no persistent memory'}
+           </span>
+ 
+           {/* Mobile drawer toggle */}
+@@ -446,6 +444,7 @@ export default function AgentDetail() {
+             profileLead={profileLead}
+             profileBody={profileBody}
+             memories={memories}
++            supportsPersistentMemory={supportsPersistentMemory}
+             expandedMemory={expandedMemory}
+             memoryContents={memoryContents}
+             toggleMemory={toggleMemory}
+@@ -490,6 +489,7 @@ export default function AgentDetail() {
+                 profileLead={profileLead}
+                 profileBody={profileBody}
+                 memories={memories}
++                supportsPersistentMemory={supportsPersistentMemory}
+                 expandedMemory={expandedMemory}
+                 memoryContents={memoryContents}
+                 toggleMemory={toggleMemory}
+@@ -590,12 +590,14 @@ export default function AgentDetail() {
+           <div className="relative z-10 flex-1 min-h-0">
+             {viewMode === 'chat' ? (
+               <AgentChat
+-                key={`chat-${name}-${activeChatSessionId || 'default'}`}
++                key={`chat-${name}`}
+                 agent={name}
+                 sessionId={activeChatSessionId || undefined}
+                 accentColor={agentColor}
+                 externalLoading={chatConnecting}
+                 externalError={chatConnectError}
++                onSessionCreated={handleChatSessionCreated}
++                onSessionMetaChange={handleChatSessionMetaChange}
+                 onPendingCountChange={handlePendingCountChange}
+                 onNeedsAttention={handleNeedsAttention}
+               />
+@@ -622,6 +624,7 @@ interface InfoRailProps {
+   profileLead: string | null
+   profileBody: string
+   memories: MemoryFile[]
++  supportsPersistentMemory: boolean
+   expandedMemory: string | null
+   memoryContents: Record<string, string>
+   toggleMemory: (name: string) => void
+@@ -643,6 +646,7 @@ function InfoRail({
+   profileLead,
+   profileBody,
+   memories,
++  supportsPersistentMemory,
+   expandedMemory,
+   memoryContents,
+   toggleMemory,
+@@ -673,7 +677,7 @@ function InfoRail({
+           active={tab === 'memory'}
+           onClick={() => setTab('memory')}
+           color={agentColor}
+-          count={memories.length}
++          count={supportsPersistentMemory ? memories.length : 0}
+         />
+       </div>
+ 
+@@ -715,7 +719,14 @@ function InfoRail({
+ 
+         {tab === 'memory' && (
+           <div className="px-5 py-4">
+-            {memories.length === 0 ? (
++            {!supportsPersistentMemory ? (
++              <div className="text-[12px] text-[#667085]">
++                <p className="mb-1">Este agente não mantém memória persistente.</p>
++                <p className="text-[11px] text-[#3F3F46]">
++                  O comportamento segue o prompt original do agente.
++                </p>
++              </div>
++            ) : memories.length === 0 ? (
+               <div className="text-[12px] text-[#667085]">
+                 <p className="mb-1">Sem memórias ainda.</p>
+                 <p className="text-[11px] text-[#3F3F46]">
+diff --git a/dashboard/frontend/src/pages/Agents.tsx b/dashboard/frontend/src/pages/Agents.tsx
+index 998640b..a931be3 100644
+--- a/dashboard/frontend/src/pages/Agents.tsx
++++ b/dashboard/frontend/src/pages/Agents.tsx
+@@ -96,6 +96,7 @@ interface Agent {
+   name: string
+   description: string
+   memory_count: number
++  supports_memory?: boolean
+   custom?: boolean
+   color?: string
+   model?: string
+@@ -652,8 +653,7 @@ export default function Agents() {
+   // Poll active agents every 5 seconds
+   useEffect(() => {
+     const fetchActive = () => {
+-      fetch('/api/agents/active')
+-        .then((r) => r.json())
++      api.get('/agents/active')
+         .then((data) => {
+           const names = (data.active_agents || []).map((a: { agent: string }) => a.agent)
+           setRunningAgents(names)
+@@ -666,7 +666,13 @@ export default function Agents() {
+   }, [])
+ 
+   const totalMemories = agents.reduce((sum, a) => sum + a.memory_count, 0)
+-  const activeCount = agents.filter((a) => a.memory_count > 0).length
++  const activeCount = useMemo(() => {
++    return new Set(
++      runningAgents
++        .map((name) => String(name || '').trim())
++        .filter(Boolean)
++    ).size
++  }, [runningAgents])
+ 
+   const counts = useMemo(() => {
+     const c = { all: agents.length, business: 0, engineering: 0, custom: 0 }
+diff --git a/dashboard/frontend/src/pages/Costs.tsx b/dashboard/frontend/src/pages/Costs.tsx
+index d8a155e..36cfebd 100644
+--- a/dashboard/frontend/src/pages/Costs.tsx
++++ b/dashboard/frontend/src/pages/Costs.tsx
+@@ -13,6 +13,13 @@ interface CostData {
+   total_cost: number
+   routines_total_cost: number
+   heartbeats_total_cost: number
++  chat_total_cost: number
++  chat_total_tokens: number
++  chat_input_tokens: number
++  chat_output_tokens: number
++  chat_cache_tokens: number
++  chat_requests: number
++  chat_sessions: number
+   total_runs: number
+   daily: { date: string; cost: number }[]
+   by_agent: { agent: string; cost: number }[]
+@@ -61,6 +68,13 @@ function normalizeCostData(raw: any): CostData {
+     total_cost: totalCost,
+     routines_total_cost: Number(raw?.routines_total_cost || 0),
+     heartbeats_total_cost: Number(raw?.heartbeats_total_cost || 0),
++    chat_total_cost: Number(raw?.chat_total_cost || 0),
++    chat_total_tokens: Number(raw?.chat_total_tokens || 0),
++    chat_input_tokens: Number(raw?.chat_input_tokens || 0),
++    chat_output_tokens: Number(raw?.chat_output_tokens || 0),
++    chat_cache_tokens: Number(raw?.chat_cache_tokens || 0),
++    chat_requests: Number(raw?.chat_requests || 0),
++    chat_sessions: Number(raw?.chat_sessions || 0),
+     total_runs: Number(raw?.total_runs || 0),
+     daily: Array.isArray(raw?.daily) ? raw.daily : [],
+     by_agent: byAgent,
+@@ -171,7 +185,8 @@ export default function Costs() {
+           <h1 className="text-2xl font-bold text-[#e6edf3] tracking-tight">Costs</h1>
+           <p className="text-[#667085] text-sm mt-1">AI usage cost analysis</p>
+         </div>
+-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
++        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
++          <SkeletonCard />
+           <SkeletonCard />
+           <SkeletonCard />
+           <SkeletonCard />
+@@ -211,7 +226,7 @@ export default function Costs() {
+       </div>
+ 
+       {/* KPI Cards */}
+-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
++      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+         <StatCard
+           label="Today"
+           value={`$${Number(data.today || 0).toFixed(2)}`}
+@@ -227,7 +242,7 @@ export default function Costs() {
+         <StatCard
+           label="Total (All)"
+           value={`$${grandTotal.toFixed(2)}`}
+-          subtitle={imageTotalCost > 0 ? `Routines + Heartbeats + ${imageCosts?.totals?.count || 0} images` : 'Routines + Heartbeats'}
++          subtitle={imageTotalCost > 0 ? `Routines + Heartbeats + Chat + ${imageCosts?.totals?.count || 0} images` : 'Routines + Heartbeats + Chat'}
+           icon={Zap}
+         />
+         <StatCard
+@@ -236,6 +251,12 @@ export default function Costs() {
+           subtitle={`${totalRuns} total runs`}
+           icon={Calculator}
+         />
++        <StatCard
++          label="Chat Tokens"
++          value={data.chat_total_tokens.toLocaleString()}
++          subtitle={`${data.chat_requests} requests • $${data.chat_total_cost.toFixed(4)}`}
++          icon={Activity}
++        />
+       </div>
+ 
+       {/* Charts */}
+@@ -252,7 +273,7 @@ export default function Costs() {
+             <LineChart data={data.daily}>
+               <CartesianGrid strokeDasharray="3 3" stroke="#21262d" />
+               <XAxis dataKey="date" tick={{ fill: '#667085', fontSize: 11 }} />
+-              <YAxis tick={{ fill: '#667085', fontSize: 11 }} tickFormatter={(v) => `$${v.toFixed(2)}`} />
++              <YAxis tick={{ fill: '#667085', fontSize: 11 }} tickFormatter={(v: number) => `$${v.toFixed(2)}`} />
+               <Tooltip
+                 contentStyle={{ background: '#161b22', border: '1px solid #21262d', borderRadius: '12px', color: '#e6edf3' }}
+                 formatter={(value: unknown) => [`$${Number(value).toFixed(4)}`, 'Cost']}
+diff --git a/dashboard/frontend/src/pages/Overview.tsx b/dashboard/frontend/src/pages/Overview.tsx
+index 634a1fd..73b68e6 100644
+--- a/dashboard/frontend/src/pages/Overview.tsx
++++ b/dashboard/frontend/src/pages/Overview.tsx
+@@ -45,6 +45,15 @@ interface ActiveAgent {
+   status?: string
+ }
+ 
++interface ActiveAgentsResponse {
++  active_agents?: Array<{
++    agent?: string
++    source?: string
++    started_at?: string
++    last_activity?: string
++  }>
++}
++
+ // --- Area color mapping for report badges ---
+ const AREA_COLORS: Record<string, { bg: string; text: string; border: string }> = {
+   'Operations': { bg: 'rgba(34,211,238,0.10)', text: '#22D3EE', border: 'rgba(34,211,238,0.25)' },
+@@ -216,17 +225,39 @@ export default function Overview() {
+   const [activeAgents, setActiveAgents] = useState<ActiveAgent[]>([])
+   const [agentsLoading, setAgentsLoading] = useState(true)
+ 
+-  useEffect(() => {
++  const fetchOverview = useCallback(() => {
+     api.get('/overview')
+-      .then(setData)
++      .then((result) => {
++        setData(result)
++        setError(null)
++      })
+       .catch((e) => setError(e.message))
+       .finally(() => setLoading(false))
+   }, [])
+ 
++  useEffect(() => {
++    fetchOverview()
++    const interval = setInterval(fetchOverview, 15000)
++    return () => clearInterval(interval)
++  }, [fetchOverview])
++
+   const fetchActiveAgents = useCallback(() => {
+     api.get('/agents/active')
+-      .then((agents: ActiveAgent[]) => {
+-        setActiveAgents(Array.isArray(agents) ? agents : [])
++      .then((payload: ActiveAgentsResponse | ActiveAgent[]) => {
++        const entries = Array.isArray(payload)
++          ? payload
++          : Array.isArray(payload?.active_agents)
++            ? payload.active_agents
++            : []
++
++        const normalized = entries
++          .map((entry: any) => ({
++            name: String(entry?.name || entry?.agent || '').trim(),
++            status: entry?.status,
++          }))
++          .filter((entry) => entry.name.length > 0)
++
++        setActiveAgents(normalized)
+       })
+       .catch(() => {
+         setActiveAgents([])
+diff --git a/dashboard/frontend/src/pages/Routines.tsx b/dashboard/frontend/src/pages/Routines.tsx
+index 66e869b..636cc25 100644
+--- a/dashboard/frontend/src/pages/Routines.tsx
++++ b/dashboard/frontend/src/pages/Routines.tsx
+@@ -251,7 +251,7 @@ export default function Routines() {
+               <BarChart data={chartData}>
+                 <CartesianGrid strokeDasharray="3 3" stroke="#21262d" />
+                 <XAxis dataKey="name" tick={{ fill: '#667085', fontSize: 11 }} angle={-30} textAnchor="end" height={60} />
+-                <YAxis tick={{ fill: '#667085', fontSize: 11 }} tickFormatter={(v) => `$${v.toFixed(2)}`} />
++                <YAxis tick={{ fill: '#667085', fontSize: 11 }} tickFormatter={(v: number) => `$${v.toFixed(2)}`} />
+                 <Tooltip
+                   contentStyle={{ background: '#161b22', border: '1px solid #21262d', borderRadius: '12px', color: '#e6edf3' }}
+                   formatter={(value: unknown) => [`$${Number(value).toFixed(4)}`, 'Cost']}
+diff --git a/dashboard/frontend/src/recharts.d.ts b/dashboard/frontend/src/recharts.d.ts
+new file mode 100644
+index 0000000..e80d836
+--- /dev/null
++++ b/dashboard/frontend/src/recharts.d.ts
+@@ -0,0 +1 @@
++declare module 'recharts';
+diff --git a/dashboard/terminal-server/package.json b/dashboard/terminal-server/package.json
+index 7b6ac84..35ca723 100644
+--- a/dashboard/terminal-server/package.json
++++ b/dashboard/terminal-server/package.json
+@@ -10,7 +10,7 @@
+   "scripts": {
+     "start": "node bin/server.js",
+     "dev": "node bin/server.js --dev",
+-    "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper node_modules/node-pty/prebuilds/darwin-x64/spawn-helper 2>/dev/null || true"
++    "postinstall": "node scripts/postinstall.js"
+   },
+   "dependencies": {
+     "@anthropic-ai/claude-agent-sdk": "^0.2.104",
+diff --git a/dashboard/terminal-server/scripts/postinstall.js b/dashboard/terminal-server/scripts/postinstall.js
+new file mode 100644
+index 0000000..bb92bad
+--- /dev/null
++++ b/dashboard/terminal-server/scripts/postinstall.js
+@@ -0,0 +1,23 @@
++const fs = require('fs');
++const path = require('path');
++
++if (process.platform === 'win32') {
++  console.log('[postinstall] Skipping node-pty chmod on Windows');
++  process.exit(0);
++}
++
++const targets = [
++  path.join(__dirname, '..', 'node_modules', 'node-pty', 'prebuilds', 'darwin-arm64', 'spawn-helper'),
++  path.join(__dirname, '..', 'node_modules', 'node-pty', 'prebuilds', 'darwin-x64', 'spawn-helper'),
++];
++
++for (const target of targets) {
++  try {
++    if (fs.existsSync(target)) {
++      fs.chmodSync(target, 0o755);
++      console.log(`[postinstall] chmod +x ${target}`);
++    }
++  } catch (err) {
++    console.warn(`[postinstall] Failed to chmod ${target}: ${err.message}`);
++  }
++}
+diff --git a/dashboard/terminal-server/src/chat-bridge.js b/dashboard/terminal-server/src/chat-bridge.js
+index c0d0ce6..1c1f397 100644
+--- a/dashboard/terminal-server/src/chat-bridge.js
++++ b/dashboard/terminal-server/src/chat-bridge.js
+@@ -6,10 +6,21 @@
+ const fs = require('fs');
+ const path = require('path');
+ const os = require('os');
++const { spawn } = require('child_process');
+ let sdkModule = null;
+ 
+ // Workspace root is three levels up from this file (dashboard/terminal-server/src/).
+ const WORKSPACE_ROOT = path.resolve(__dirname, '..', '..', '..');
++const ALLOWED_CLI = new Set(['claude', 'openclaude']);
++const ALLOWED_VARS = new Set([
++  'CLAUDE_CODE_USE_OPENAI', 'CLAUDE_CODE_USE_GEMINI',
++  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
++  'OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL',
++  'CODEX_AUTH_JSON_PATH', 'CODEX_API_KEY',
++  'GEMINI_API_KEY', 'GEMINI_MODEL',
++  'AWS_REGION', 'AWS_BEARER_TOKEN_BEDROCK',
++  'ANTHROPIC_VERTEX_PROJECT_ID', 'CLOUD_ML_REGION',
++]);
+ 
+ /**
+  * Read chat.trustMode from config/workspace.yaml.
+@@ -27,6 +38,47 @@ function readTrustMode() {
+   }
+ }
+ 
++function loadProviderConfig() {
++  try {
++    const configPath = path.join(WORKSPACE_ROOT, 'config', 'providers.json');
++    if (!fs.existsSync(configPath)) {
++      return { active: 'anthropic', cli_command: 'claude', env_vars: {} };
++    }
++
++    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
++    const active = config.active_provider || 'anthropic';
++    const provider = config.providers?.[active] || {};
++
++    let cliCommand = provider.cli_command || 'claude';
++    if (!ALLOWED_CLI.has(cliCommand)) {
++      cliCommand = 'claude';
++    }
++
++    const envVars = Object.fromEntries(
++      Object.entries(provider.env_vars || {}).filter(
++        ([k, v]) => v !== '' && ALLOWED_VARS.has(k)
++      )
++    );
++
++    if (!envVars.OPENAI_MODEL) {
++      if (active === 'codex_auth') {
++        envVars.OPENAI_MODEL = 'codexplan';
++      } else if (active === 'openai') {
++        envVars.OPENAI_MODEL = 'gpt-4.1';
++      }
++    }
++
++    if (active === 'codex_auth' && 'OPENAI_API_KEY' in envVars) {
++      delete envVars.OPENAI_API_KEY;
++    }
++
++    return { active, cli_command: cliCommand, env_vars: envVars };
++  } catch (err) {
++    console.warn(`[chat-bridge] Could not read providers.json: ${err.message}`);
++    return { active: 'anthropic', cli_command: 'claude', env_vars: {} };
++  }
++}
++
+ // Tools that run silently without user confirmation.
+ const AUTO_APPROVE = new Set([
+   'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'ToolSearch',
+@@ -177,12 +229,193 @@ function detectCreatedTicketId(text) {
+   return _regexScanForTicket(text);
+ }
+ 
++function extractCliResult(rawStdout) {
++  const text = (rawStdout || '').trim();
++  if (!text) return { resultText: '', usage: undefined, totalCost: undefined, modelUsage: undefined, sessionId: undefined, parsed: false };
++
++  try {
++    const parsed = JSON.parse(text);
++    return {
++      resultText: parsed.result || text,
++      usage: parsed.usage,
++      totalCost: parsed.total_cost_usd,
++      modelUsage: parsed.modelUsage,
++      sessionId: parsed.session_id,
++      parsed: true,
++    };
++  } catch {}
++
++  const lastBrace = text.lastIndexOf('{');
++  if (lastBrace !== -1) {
++    const candidate = text.slice(lastBrace);
++    try {
++      const parsed = JSON.parse(candidate);
++      return {
++        resultText: parsed.result || text,
++        usage: parsed.usage,
++        totalCost: parsed.total_cost_usd,
++        modelUsage: parsed.modelUsage,
++        sessionId: parsed.session_id,
++        parsed: true,
++      };
++    } catch {}
++  }
++
++  return { resultText: text, usage: undefined, totalCost: undefined, modelUsage: undefined, sessionId: undefined, parsed: false };
++}
++
++function splitJsonLines(buffer) {
++  const lines = buffer.split(/\r?\n/);
++  const rest = lines.pop() || '';
++  return { lines: lines.filter(Boolean), rest };
++}
++
++function buildCliUserMessage(prompt, files) {
++  const content = [];
++
++  if (prompt) {
++    content.push({
++      type: 'text',
++      text: prompt,
++    });
++  }
++
++  if (Array.isArray(files)) {
++    for (const file of files) {
++      if (!file?.base64 || typeof file.type !== 'string' || !file.type.startsWith('image/')) continue;
++      content.push({
++        type: 'image',
++        source: {
++          type: 'base64',
++          media_type: file.type,
++          data: file.base64,
++        },
++      });
++    }
++  }
++
++  return {
++    type: 'user',
++    session_id: '',
++    message: {
++      role: 'user',
++      content: content.length === 1 && content[0].type === 'text' ? content[0].text : content,
++    },
++    parent_tool_use_id: null,
++  };
++}
++
++function buildCliPermissionResponse(requestId, approved, input) {
++  return {
++    type: 'control_response',
++    response: approved
++      ? {
++          subtype: 'success',
++          request_id: requestId,
++          response: {
++            behavior: 'allow',
++            updatedInput: (input && typeof input === 'object') ? input : {},
++          },
++        }
++      : {
++          subtype: 'success',
++          request_id: requestId,
++          response: {
++            behavior: 'deny',
++            message: 'User denied this tool use.',
++          },
++        },
++  };
++}
++
++function buildCliElicitationResponse(requestId, action, content) {
++  const response = { action };
++  if (content && typeof content === 'object') {
++    response.content = content;
++  }
++  return {
++    type: 'control_response',
++    response: {
++      subtype: 'success',
++      request_id: requestId,
++      response,
++    },
++  };
++}
++
++function buildAttachedFilesPrompt(files) {
++  if (!Array.isArray(files) || files.length === 0) return '';
++
++  const imageLines = [];
++  const fileLines = [];
++  for (const f of files) {
++    if (!f?.path || !f?.name) continue;
++    const type = typeof f.type === 'string' ? f.type : 'application/octet-stream';
++    const line = `- ${f.name}: ${f.path}`;
++    if (type.startsWith('image/')) {
++      imageLines.push(line);
++    } else {
++      fileLines.push(line);
++    }
++  }
++
++  const parts = [];
++  if (imageLines.length > 0) {
++    parts.push(
++      '[Attached images]',
++      'The images below are attached to this message for direct visual inspection and were also saved as local temp files for this chat session.',
++      'Use the image attachment itself for visual understanding.',
++      'Use the saved local path only when you need filesystem operations on the file.',
++      ...imageLines,
++    );
++  }
++  if (fileLines.length > 0) {
++    parts.push(
++      '[Attached files - inspect by path if needed]',
++      ...fileLines,
++    );
++  }
++
++  return parts.join('\n');
++}
++
++function buildRuntimeContextBlock(agentName, sessionId) {
++  const runtimeLines = [
++    '## Runtime context',
++    'You are running inside the EvoNexus dashboard.',
++  ];
++  if (agentName) {
++    runtimeLines.push(`- Current agent slug: ${agentName}`);
++  }
++  runtimeLines.push(`- Current chat session id: ${sessionId}`);
++  runtimeLines.push('');
++  runtimeLines.push(`When you create a ticket via \`evo.post("/api/tickets", {...})\`, include \`source_agent: "${agentName}"\` and \`source_session_id: "${sessionId}"\` in the payload so the ticket records who created it.`);
++  runtimeLines.push('');
++  runtimeLines.push('## Tool permission policy');
++  runtimeLines.push('Read/Glob/Grep/WebFetch/ToolSearch/Skill run automatically.');
++  runtimeLines.push('Write/Edit/Bash/Agent/NotebookEdit need user approval per call when the provider supports approval callbacks in this environment.');
++  runtimeLines.push('Do not ask for permission in plain text for safe read/search tools.');
++  return runtimeLines.join('\n');
++}
++
+ class ChatBridge {
+   constructor() {
+     this.sessions = new Map(); // sessionId -> { query, abortController, active, sdkSessionId }
+   }
+ 
+   async startSession(sessionId, options = {}) {
++    const providerConfig = loadProviderConfig();
++    if (providerConfig.active && providerConfig.active !== 'anthropic') {
++      return this._startCliSession(sessionId, {
++        ...options,
++        providerConfig,
++      });
++    }
++
++    return this._startSdkSession(sessionId, options);
++  }
++
++  async _startSdkSession(sessionId, options = {}) {
+     const { query: sdkQuery } = await loadSDK();
+ 
+     const {
+@@ -228,7 +461,7 @@ class ChatBridge {
+         runtimeLines.push('Read/Glob/Grep/WebFetch/ToolSearch/Skill run automatically.');
+         runtimeLines.push('Write/Edit/Bash/Agent/NotebookEdit need user approval per call — the UI shows a card with Allow/Deny buttons. Don\'t ask for permission in text; just call the tool and the user will respond in the UI.');
+ 
+-        const runtimeBlock = runtimeLines.join('\n');
++        const runtimeBlock = buildRuntimeContextBlock(agentName, sessionId);
+ 
+         // Use systemPrompt with claude_code preset + agent prompt appended
+         queryOptions.systemPrompt = {
+@@ -281,6 +514,33 @@ class ChatBridge {
+       });
+     };
+ 
++    const requestElicitationFromUser = (request) => {
++      const currentSession = this.sessions.get(sessionId);
++      if (!currentSession || !currentSession.active) {
++        return Promise.resolve({ action: 'cancel' });
++      }
++      const requestId = request.elicitationId || `elicit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
++      return new Promise((resolve) => {
++        if (!currentSession.pendingElicitations) currentSession.pendingElicitations = new Map();
++        currentSession.pendingElicitations.set(requestId, resolve);
++        if (onMessage) {
++          onMessage({
++            type: 'elicitation_request',
++            requestId,
++            mcpServerName: request.serverName,
++            message: request.message,
++            mode: request.mode || 'form',
++            url: request.url || null,
++            elicitationId: request.elicitationId || null,
++            requestedSchema: request.requestedSchema || null,
++            title: request.title || null,
++            displayName: request.displayName || null,
++            description: request.description || null,
++          });
++        }
++      });
++    };
++
+     queryOptions.canUseTool = async (toolName, input, sdkOptions) => {
+       if (readTrustMode() || AUTO_APPROVE.has(toolName)) {
+         return { behavior: 'allow' };
+@@ -323,6 +583,8 @@ class ChatBridge {
+       }],
+     };
+ 
++    queryOptions.onElicitation = async (request) => requestElicitationFromUser(request);
++
+     // Enable subagent progress summaries
+     queryOptions.agentProgressSummaries = true;
+ 
+@@ -358,6 +620,8 @@ class ChatBridge {
+       abortController,
+       agentName,
+       sdkSessionId: sdkSessionId || null,
++      pendingApprovals: new Map(),
++      pendingElicitations: new Map(),
+     };
+     this.sessions.set(sessionId, session);
+ 
+@@ -431,12 +695,345 @@ class ChatBridge {
+     return { sessionId, sdkSessionId: session.sdkSessionId };
+   }
+ 
++  async _startCliSession(sessionId, options = {}) {
++    const {
++      agentName,
++      workingDir,
++      prompt,
++      files,
++      sdkSessionId,
++      providerConfig,
++      onMessage,
++      onError,
++      onComplete,
++    } = options;
++
++    if (this.sessions.has(sessionId)) {
++      await this.stopSession(sessionId);
++    }
++
++    const cwd = workingDir || process.cwd();
++    const cliCommand = providerConfig?.cli_command || 'openclaude';
++    const providerEnv = { ...(providerConfig?.env_vars || {}) };
++    console.log(`[chat-bridge] Using CLI backend for session ${sessionId}: provider=${providerConfig?.active || 'unknown'} cli=${cliCommand} agent=${agentName || 'none'} resume=${sdkSessionId || 'new'}`);
++
++    const promptParts = [];
++    const runtimeBlock = buildRuntimeContextBlock(agentName, sessionId);
++    if (prompt) {
++      promptParts.push(prompt);
++    }
++
++    let savedPaths = [];
++    if (files && files.length > 0) {
++      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'evo-chat-'));
++      for (const f of files) {
++        if (!f.base64) continue;
++        const safeName = f.name.replace(/[^a-zA-Z0-9._-]/g, '_');
++        const filePath = path.join(tmpDir, safeName);
++        fs.writeFileSync(filePath, Buffer.from(f.base64, 'base64'));
++        savedPaths.push({ name: f.name, path: filePath, type: f.type });
++      }
++    }
++    if (savedPaths.length > 0) {
++      const attachmentPrompt = buildAttachedFilesPrompt(savedPaths);
++      if (attachmentPrompt) {
++        promptParts.push(attachmentPrompt);
++      }
++    }
++
++    const finalPrompt = promptParts.filter(Boolean).join('\n\n');
++    const args = [
++      '-p',
++      '--input-format', 'stream-json',
++      '--output-format', 'stream-json',
++      '--include-partial-messages',
++      '--verbose',
++      '--permission-mode', 'default',
++      '--permission-prompt-tool', 'stdio',
++      '--allowedTools', 'Read,Glob,Grep,WebFetch,ToolSearch,Skill',
++      '--append-system-prompt', runtimeBlock,
++    ];
++    if (sdkSessionId) {
++      args.push('--resume', sdkSessionId);
++    }
++    if (agentName) {
++      args.push('--agent', agentName);
++    }
++    const SYSTEM_VARS = [
++      'HOME', 'USER', 'SHELL', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE',
++      'LOGNAME', 'HOSTNAME', 'XDG_RUNTIME_DIR', 'XDG_DATA_HOME',
++      'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'TMPDIR',
++      'SSH_AUTH_SOCK', 'SSH_AGENT_PID',
++      'NVM_DIR', 'NVM_BIN', 'NVM_INC',
++      'CODEX_HOME', 'CLAUDE_CONFIG_DIR',
++    ];
++    const cleanEnv = {};
++    for (const key of SYSTEM_VARS) {
++      if (process.env[key]) cleanEnv[key] = process.env[key];
++    }
++
++    const child = spawn(cliCommand, args, {
++      cwd,
++      env: {
++        ...cleanEnv,
++        ...providerEnv,
++        TERM: 'dumb',
++      },
++      stdio: ['pipe', 'pipe', 'pipe'],
++    });
++
++    const session = {
++      active: true,
++      backend: 'cli',
++      process: child,
++      sdkSessionId: null,
++      stdout: '',
++      stderr: '',
++      stdoutBuffer: '',
++      sawResult: false,
++      sawError: false,
++      pendingApprovals: new Map(),
++      pendingElicitations: new Map(),
++    };
++    this.sessions.set(sessionId, session);
++    console.log(`[chat-bridge] Spawned CLI process for session ${sessionId}: ${cliCommand} ${args.join(' ')} [prompt via stdin]`);
++
++    try {
++      child.stdin.write(`${JSON.stringify(buildCliUserMessage(finalPrompt, files))}\n`);
++    } catch (err) {
++      console.error(`[chat-bridge] Failed to write prompt to CLI stdin for session ${sessionId}:`, err.message || err);
++    }
++
++    child.stdout.on('data', (chunk) => {
++      const text = chunk.toString();
++      session.stdout += text;
++      session.stdoutBuffer += text;
++      const { lines, rest } = splitJsonLines(session.stdoutBuffer);
++      session.stdoutBuffer = rest;
++
++      for (const line of lines) {
++        let message;
++        try {
++          message = JSON.parse(line);
++        } catch (err) {
++          console.warn(`[chat-bridge] Failed to parse CLI stream line for session ${sessionId}: ${err.message}; line=${JSON.stringify(line.slice(0, 240))}`);
++          continue;
++        }
++
++        if (message.session_id && !session.sdkSessionId) {
++          session.sdkSessionId = message.session_id;
++          if (onMessage) {
++            onMessage({ type: 'session_id', sdkSessionId: message.session_id });
++          }
++        }
++
++        if (message.type === 'control_request') {
++          if (message.request?.subtype === 'can_use_tool') {
++            const requestId = message.request_id;
++            const toolName = message.request.tool_name || 'Tool';
++            const input = message.request.input || {};
++            if (readTrustMode() || AUTO_APPROVE.has(toolName)) {
++              try {
++                child.stdin.write(`${JSON.stringify(buildCliPermissionResponse(requestId, true, input))}\n`);
++              } catch (err) {
++                console.error(`[chat-bridge] Failed to auto-approve CLI tool request for session ${sessionId}:`, err.message || err);
++              }
++              continue;
++            }
++            session.pendingApprovals.set(requestId, {
++              toolName,
++              input,
++              toolUseId: message.request.tool_use_id || null,
++              agentId: message.request.agent_id || null,
++            });
++            if (onMessage) {
++              onMessage({
++                type: 'permission_request',
++                requestId,
++                toolName,
++                input,
++                agentId: message.request.agent_id || null,
++                title: message.request.action_description || null,
++                description: message.request.decision_reason || null,
++              });
++            }
++          } else if (message.request?.subtype === 'elicitation') {
++            const requestId = message.request_id;
++            session.pendingElicitations.set(requestId, {
++              mcpServerName: message.request.mcp_server_name || null,
++              message: message.request.message || '',
++              mode: message.request.mode || 'form',
++              url: message.request.url || null,
++              elicitationId: message.request.elicitation_id || null,
++              requestedSchema: message.request.requested_schema || null,
++              title: message.request.title || null,
++              displayName: message.request.display_name || null,
++              description: message.request.description || null,
++            });
++            if (onMessage) {
++              onMessage({
++                type: 'elicitation_request',
++                requestId,
++                mcpServerName: message.request.mcp_server_name || null,
++                message: message.request.message || '',
++                mode: message.request.mode || 'form',
++                url: message.request.url || null,
++                elicitationId: message.request.elicitation_id || null,
++                requestedSchema: message.request.requested_schema || null,
++                title: message.request.title || null,
++                displayName: message.request.display_name || null,
++                description: message.request.description || null,
++              });
++            }
++          } else {
++            console.log(`[chat-bridge] CLI control request for session ${sessionId}: subtype=${message.request?.subtype || 'unknown'}`);
++          }
++          continue;
++        }
++
++        if (message.type === 'control_cancel_request') {
++          if (message.request_id) {
++            session.pendingApprovals.delete(message.request_id);
++            session.pendingElicitations.delete(message.request_id);
++          }
++          continue;
++        }
++
++        if (message.type === 'control_response') {
++          const resolvedRequestId = message.response?.request_id;
++          if (resolvedRequestId) {
++            session.pendingApprovals.delete(resolvedRequestId);
++            session.pendingElicitations.delete(resolvedRequestId);
++          }
++          continue;
++        }
++
++        if (message.type === 'result') {
++          session.sawResult = true;
++          session.active = false;
++          if (message.subtype !== 'success' || message.is_error) {
++            session.sawError = true;
++          }
++        }
++
++        if (message.type === 'system' || message.type === 'assistant' || message.type === 'result' || message.type === 'stream_event' || message.type === 'tool_use_summary') {
++          if (onMessage) {
++            onMessage(this._transformMessage(message));
++          }
++        } else {
++          console.log(`[chat-bridge] CLI raw message for session ${sessionId}: type=${message.type || 'unknown'}`);
++        }
++      }
++    });
++
++    child.stderr.on('data', (chunk) => {
++      session.stderr += chunk.toString();
++    });
++
++    child.on('error', (err) => {
++      console.error(`[chat-bridge] CLI session error in ${sessionId}:`, err.message || err);
++      session.active = false;
++      this.sessions.delete(sessionId);
++      if (onError) onError(err);
++    });
++
++    child.on('close', (code, signal) => {
++      const rawStdout = (session.stdout + session.stdoutBuffer).trim();
++      const rawStderr = session.stderr.trim();
++      session.active = false;
++      if (session.pendingApprovals) {
++        session.pendingApprovals.clear();
++      }
++      if (session.pendingElicitations) {
++        session.pendingElicitations.clear();
++      }
++      this.sessions.delete(sessionId);
++      console.log(`[chat-bridge] CLI session ${sessionId} closed: code=${code} signal=${signal || 'none'} stdout=${rawStdout.length}B stderr=${rawStderr.length}B`);
++
++      if (signal === 'SIGTERM' || signal === 'SIGKILL') {
++        if (onComplete) onComplete({ sdkSessionId: null });
++        return;
++      }
++
++      if (session.sawResult && !session.sawError) {
++        if (code !== 0) {
++          console.warn(`[chat-bridge] CLI session ${sessionId} produced a successful result but exited with code=${code}; treating turn as success`);
++        }
++        if (onComplete) onComplete({ sdkSessionId: session.sdkSessionId || null });
++        return;
++      }
++
++      if (code === 0) {
++        if (!session.sawResult) {
++          const { resultText, usage, totalCost, modelUsage, sessionId: resultSessionId, parsed } = extractCliResult(rawStdout);
++          if (!parsed && rawStdout) {
++            console.warn(`[chat-bridge] CLI stdout for session ${sessionId} was not clean JSON; falling back to raw text preview=${JSON.stringify(rawStdout.slice(0, 240))}`);
++          }
++          if (!resultText) {
++            console.warn(`[chat-bridge] CLI session ${sessionId} returned success with empty result text`);
++          }
++          if (onMessage) {
++            if (resultText) {
++              onMessage({ type: 'message_start' });
++              onMessage({ type: 'text_start' });
++              onMessage({ type: 'text_delta', text: resultText });
++            }
++            onMessage({
++              type: 'result',
++              subtype: 'success',
++              isError: false,
++              usage,
++              totalCost,
++              modelUsage,
++              sessionId: resultSessionId || null,
++            });
++          }
++        }
++        if (onComplete) onComplete({ sdkSessionId: session.sdkSessionId || null });
++        return;
++      }
++
++      console.error(`[chat-bridge] CLI session ${sessionId} failed: stderr=${JSON.stringify(rawStderr.slice(0, 500))} stdout=${JSON.stringify(rawStdout.slice(0, 500))}`);
++      const { resultText } = extractCliResult(rawStdout);
++      const error = new Error(rawStderr || resultText || `CLI exited with code ${code}`);
++      if (onError) onError(error);
++    });
++
++    return { sessionId, sdkSessionId: null };
++  }
++
+   async stopSession(sessionId) {
+     const session = this.sessions.get(sessionId);
+     if (!session) return;
+ 
+     const sdkSessionId = session.sdkSessionId;
+     session.active = false;
++    if (session.backend === 'cli' && session.process) {
++      if (session.pendingApprovals && session.pendingApprovals.size > 0) {
++        for (const [requestId, request] of session.pendingApprovals.entries()) {
++          try {
++            session.process.stdin.write(`${JSON.stringify(buildCliPermissionResponse(requestId, false, request?.input))}\n`);
++          } catch {}
++        }
++        session.pendingApprovals.clear();
++      }
++      if (session.pendingElicitations && session.pendingElicitations.size > 0) {
++        for (const [requestId] of session.pendingElicitations.entries()) {
++          try {
++            session.process.stdin.write(`${JSON.stringify(buildCliElicitationResponse(requestId, 'cancel'))}\n`);
++          } catch {}
++        }
++        session.pendingElicitations.clear();
++      }
++      try {
++        session.process.stdin.end();
++      } catch {}
++      try {
++        session.process.kill('SIGTERM');
++      } catch {}
++      this.sessions.delete(sessionId);
++      return { sdkSessionId };
++    }
+     // Deny all pending approval requests so awaiting canUseTool promises resolve.
+     if (session.pendingApprovals && session.pendingApprovals.size > 0) {
+       for (const resolve of session.pendingApprovals.values()) {
+@@ -444,6 +1041,12 @@ class ChatBridge {
+       }
+       session.pendingApprovals.clear();
+     }
++    if (session.pendingElicitations && session.pendingElicitations.size > 0) {
++      for (const resolve of session.pendingElicitations.values()) {
++        resolve({ action: 'cancel' });
++      }
++      session.pendingElicitations.clear();
++    }
+     try {
+       session.abortController.abort();
+     } catch {}
+@@ -458,10 +1061,24 @@ class ChatBridge {
+   respondToApproval(sessionId, requestId, approved) {
+     const session = this.sessions.get(sessionId);
+     if (!session?.pendingApprovals) return false;
+-    const resolve = session.pendingApprovals.get(requestId);
+-    if (!resolve) return false;
++    const pending = session.pendingApprovals.get(requestId);
++    if (!pending) return false;
+     session.pendingApprovals.delete(requestId);
+-    resolve(
++
++    if (session.backend === 'cli') {
++      if (!session.process?.stdin || session.process.stdin.destroyed) {
++        return false;
++      }
++      try {
++        session.process.stdin.write(`${JSON.stringify(buildCliPermissionResponse(requestId, approved, pending.input))}\n`);
++        return true;
++      } catch (err) {
++        console.error(`[chat-bridge] Failed to send CLI approval response for session ${sessionId}:`, err.message || err);
++        return false;
++      }
++    }
++
++    pending(
+       approved
+         ? { behavior: 'allow' }
+         : { behavior: 'deny', message: 'User denied this tool use.' }
+@@ -469,6 +1086,30 @@ class ChatBridge {
+     return true;
+   }
+ 
++  respondToElicitation(sessionId, requestId, action, content) {
++    const session = this.sessions.get(sessionId);
++    if (!session?.pendingElicitations) return false;
++    const pending = session.pendingElicitations.get(requestId);
++    if (!pending) return false;
++    session.pendingElicitations.delete(requestId);
++
++    if (session.backend === 'cli') {
++      if (!session.process?.stdin || session.process.stdin.destroyed) {
++        return false;
++      }
++      try {
++        session.process.stdin.write(`${JSON.stringify(buildCliElicitationResponse(requestId, action, content))}\n`);
++        return true;
++      } catch (err) {
++        console.error(`[chat-bridge] Failed to send CLI elicitation response for session ${sessionId}:`, err.message || err);
++        return false;
++      }
++    }
++
++    pending({ action, content });
++    return true;
++  }
++
+   getSdkSessionId(sessionId) {
+     const session = this.sessions.get(sessionId);
+     return session?.sdkSessionId || null;
+@@ -582,6 +1223,7 @@ class ChatBridge {
+           totalCost: msg.total_cost_usd,
+           numTurns: msg.num_turns,
+           usage: msg.usage,
++          modelUsage: msg.modelUsage,
+           errors: msg.errors,
+           sessionId: msg.session_id,
+         };
+diff --git a/dashboard/terminal-server/src/server.js b/dashboard/terminal-server/src/server.js
+index c3482e4..71a6b88 100644
+--- a/dashboard/terminal-server/src/server.js
++++ b/dashboard/terminal-server/src/server.js
+@@ -9,6 +9,130 @@ const { ChatBridge } = require('./chat-bridge');
+ const SessionStore = require('./utils/session-store');
+ const ChatLogger = require('./utils/chat-logger');
+ 
++function toNumber(value) {
++  const num = Number(value);
++  return Number.isFinite(num) ? num : 0;
++}
++
++function sanitizeFilesForHistory(files) {
++  if (!Array.isArray(files)) return undefined;
++  return files.map((file) => ({
++    name: file?.name,
++    type: file?.type,
++    previewUrl: file?.previewUrl,
++  }));
++}
++
++function accumulateSessionUsage(session, result) {
++  if (!session) return;
++
++  if (!session.sessionUsage) {
++    session.sessionUsage = {
++      requests: 0,
++      inputTokens: 0,
++      outputTokens: 0,
++      cacheTokens: 0,
++      totalCost: 0,
++      models: {},
++    };
++  }
++
++  const usage = result?.usage || {};
++  const modelUsage = result?.modelUsage || usage.modelUsage || {};
++
++  session.sessionUsage.requests += 1;
++  session.sessionUsage.inputTokens += toNumber(usage.input_tokens || usage.inputTokens);
++  session.sessionUsage.outputTokens += toNumber(usage.output_tokens || usage.outputTokens);
++  session.sessionUsage.cacheTokens += toNumber(usage.cache_creation_input_tokens || 0)
++    + toNumber(usage.cache_read_input_tokens || 0)
++    + toNumber(usage.cacheTokens || 0);
++  session.sessionUsage.totalCost += toNumber(result?.totalCost);
++
++  for (const [modelName, stats] of Object.entries(modelUsage)) {
++    if (!session.sessionUsage.models[modelName]) {
++      session.sessionUsage.models[modelName] = {
++        requests: 0,
++        inputTokens: 0,
++        outputTokens: 0,
++        cacheReadInputTokens: 0,
++        cacheCreationInputTokens: 0,
++        costUSD: 0,
++      };
++    }
++
++    const modelEntry = session.sessionUsage.models[modelName];
++    modelEntry.requests += 1;
++    modelEntry.inputTokens += toNumber(stats.inputTokens || stats.input_tokens);
++    modelEntry.outputTokens += toNumber(stats.outputTokens || stats.output_tokens);
++    modelEntry.cacheReadInputTokens += toNumber(stats.cacheReadInputTokens || stats.cache_read_input_tokens);
++    modelEntry.cacheCreationInputTokens += toNumber(stats.cacheCreationInputTokens || stats.cache_creation_input_tokens);
++    modelEntry.costUSD += toNumber(stats.costUSD || stats.cost_usd);
++  }
++}
++
++function buildChatSystemMessage(text) {
++  return {
++    role: 'system',
++    text,
++    ts: Date.now(),
++  };
++}
++
++function buildNativeSessionName(agentName, date = new Date()) {
++  return `${agentName} — ${date.toLocaleString()}`;
++}
++
++function cloneAssistantBlocks(blocks) {
++  if (!Array.isArray(blocks)) return [];
++  return blocks.map((block) => {
++    if (!block || typeof block !== 'object') return block;
++    return { ...block };
++  });
++}
++
++function upsertStreamingAssistantMessage(session, blocks) {
++  if (!session || !Array.isArray(session.chatHistory) || !Array.isArray(blocks) || blocks.length === 0) return;
++
++  const nextBlocks = cloneAssistantBlocks(blocks);
++  const last = session.chatHistory[session.chatHistory.length - 1];
++  if (last?.role === 'assistant' && last?.streaming) {
++    last.blocks = nextBlocks;
++    if (!last.ts) last.ts = Date.now();
++    return;
++  }
++
++  session.chatHistory.push({
++    role: 'assistant',
++    blocks: nextBlocks,
++    ts: Date.now(),
++    streaming: true,
++  });
++}
++
++function finalizeStreamingAssistantMessage(session, blocks) {
++  if (!session || !Array.isArray(session.chatHistory) || !Array.isArray(blocks) || blocks.length === 0) return null;
++
++  const assistantMsg = {
++    role: 'assistant',
++    blocks: cloneAssistantBlocks(blocks),
++    ts: Date.now(),
++    streaming: false,
++  };
++  const last = session.chatHistory[session.chatHistory.length - 1];
++  if (last?.role === 'assistant' && last?.streaming) {
++    session.chatHistory[session.chatHistory.length - 1] = {
++      ...last,
++      blocks: assistantMsg.blocks,
++      ts: assistantMsg.ts,
++      streaming: false,
++    };
++    return session.chatHistory[session.chatHistory.length - 1];
++  }
++
++  session.chatHistory.push(assistantMsg);
++  return assistantMsg;
++}
++
+ class TerminalServer {
+   constructor(options = {}) {
+     this.port = options.port || 32352;
+@@ -150,6 +274,7 @@ class TerminalServer {
+         outputBuffer: [],
+         maxBufferSize: 1000,
+       };
++      session.name = buildNativeSessionName(agentName, session.created);
+       this.claudeSessions.set(sessionId, session);
+       this.saveSessionsToDisk();
+ 
+@@ -207,6 +332,29 @@ class TerminalServer {
+       res.json({ sessions });
+     });
+ 
++    this.app.get('/api/sessions/active', (_req, res) => {
++      const activeSessions = [];
++      for (const [id, s] of this.claudeSessions.entries()) {
++        const bridgeActive = this.chatBridge.isActive(id);
++        const isChatSession = s.mode === 'chat';
++        const isActive = isChatSession ? bridgeActive : Boolean(s.active || bridgeActive);
++        if (isChatSession && s.active !== bridgeActive) {
++          s.active = bridgeActive;
++        }
++        if (!isActive || !s.agentName) continue;
++
++        activeSessions.push({
++          sessionId: id,
++          agent: s.agentName,
++          name: s.name,
++          mode: s.mode || null,
++          startedAt: s.sessionStartTime || s.created || null,
++          lastActivity: s.lastActivity || null,
++        });
++      }
++      res.json({ active_sessions: activeSessions });
++    });
++
+     // Create a NEW session for an agent (always creates, never reuses)
+     this.app.post('/api/sessions/create', (req, res) => {
+       const { agentName, workingDir } = req.body;
+@@ -243,6 +391,7 @@ class TerminalServer {
+         outputBuffer: [],
+         maxBufferSize: 1000,
+       };
++      session.name = buildNativeSessionName(agentName, session.created);
+       this.claudeSessions.set(sessionId, session);
+       this.saveSessionsToDisk();
+ 
+@@ -514,7 +663,7 @@ class TerminalServer {
+             const userMsg = {
+               role: 'user',
+               text: data.prompt,
+-              files: data.files || undefined,
++              files: sanitizeFilesForHistory(data.files),
+               ts: Date.now(),
+             };
+             chatSession.chatHistory.push(userMsg);
+@@ -568,6 +717,24 @@ class TerminalServer {
+                     return;
+                   }
+ 
++                  if (msg.type === 'elicitation_request') {
++                    this.broadcastToSession(wsInfo.claudeSessionId, {
++                      type: 'elicitation_request',
++                      sessionId: wsInfo.claudeSessionId,
++                      requestId: msg.requestId,
++                      mcpServerName: msg.mcpServerName || null,
++                      message: msg.message || '',
++                      mode: msg.mode || 'form',
++                      url: msg.url || null,
++                      elicitationId: msg.elicitationId || null,
++                      requestedSchema: msg.requestedSchema || null,
++                      title: msg.title || null,
++                      displayName: msg.displayName || null,
++                      description: msg.description || null,
++                    });
++                    return;
++                  }
++
+                   // Auto-bind session to a ticket when the agent creates one.
+                   // Only binds if not already bound — doesn't overwrite user's manual pick.
+                   if (msg.type === 'ticket_detected' && msg.ticketId) {
+@@ -582,46 +749,71 @@ class TerminalServer {
+                     return;
+                   }
+ 
+-                  // Build assistant blocks for history
+-                  if (msg.type === 'text_start' || msg.type === 'message_start') {
+-                    if (!isStreaming) {
+-                      isStreaming = true;
+-                      assistantBlocks = [];
+-                    }
+-                  }
+-                  if (msg.type === 'text_delta') {
+-                    const last = assistantBlocks[assistantBlocks.length - 1];
+-                    if (last?.type === 'text') {
+-                      last.text += msg.text || '';
+-                    } else {
+-                      assistantBlocks.push({ type: 'text', text: msg.text || '' });
+-                    }
++                  if (msg.type === 'result' && !msg.isError) {
++                    accumulateSessionUsage(chatSession, msg);
+                   }
+-                  if (msg.type === 'tool_use_start') {
+-                    assistantBlocks.push({
+-                      type: 'tool_use',
+-                      toolName: msg.toolName,
++
++                  // Build assistant blocks for history
++	                  if (msg.type === 'text_start' || msg.type === 'message_start') {
++	                    if (!isStreaming) {
++	                      isStreaming = true;
++	                      assistantBlocks = [];
++	                    }
++	                    if (assistantBlocks.length > 0) {
++	                      upsertStreamingAssistantMessage(chatSession, assistantBlocks);
++	                    }
++	                  }
++	                  if (msg.type === 'text_delta') {
++	                    const last = assistantBlocks[assistantBlocks.length - 1];
++	                    if (last?.type === 'text') {
++	                      last.text += msg.text || '';
++	                    } else {
++	                      assistantBlocks.push({ type: 'text', text: msg.text || '' });
++	                    }
++	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
++	                  }
++	                  if (msg.type === 'tool_use_start') {
++	                    assistantBlocks.push({
++	                      type: 'tool_use',
++	                      toolName: msg.toolName,
+                       toolId: msg.toolId,
+-                      input: '',
+-                      done: false,
+-                    });
+-                  }
+-                  if (msg.type === 'tool_input_delta') {
+-                    const last = assistantBlocks[assistantBlocks.length - 1];
+-                    if (last?.type === 'tool_use') {
+-                      last.input += msg.json || '';
+-                    }
+-                  }
+-                  if (msg.type === 'block_stop') {
+-                    const last = assistantBlocks[assistantBlocks.length - 1];
+-                    if (last?.type === 'tool_use') last.done = true;
+-                  }
++	                      input: '',
++	                      done: false,
++	                    });
++	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
++	                  }
++	                  if (msg.type === 'tool_input_delta') {
++	                    const last = assistantBlocks[assistantBlocks.length - 1];
++	                    if (last?.type === 'tool_use') {
++	                      last.input += msg.json || '';
++	                    }
++	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
++	                  }
++	                  if (msg.type === 'block_stop') {
++	                    const last = assistantBlocks[assistantBlocks.length - 1];
++	                    if (last?.type === 'tool_use') last.done = true;
++	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
++	                  }
++	                  if (msg.type === 'assistant_message' && Array.isArray(msg.blocks) && msg.blocks.length > 0) {
++	                    assistantBlocks = cloneAssistantBlocks(msg.blocks);
++	                    isStreaming = true;
++	                    upsertStreamingAssistantMessage(chatSession, assistantBlocks);
++	                  }
+ 
+                   // Also broadcast the current assistant blocks for live history
+                   this.broadcastToSession(wsInfo.claudeSessionId, { type: 'chat_event', event: msg });
+                 },
+-                onError: (err) => {
+-                  chatSession.active = false;
++	                onError: (err) => {
++	                  chatSession.active = false;
++	                  const last = chatSession.chatHistory[chatSession.chatHistory.length - 1];
++	                  if (last?.role === 'assistant' && last?.streaming) {
++	                    last.streaming = false;
++	                  }
++	                  this.persistChatSystemMessage(
++	                    wsInfo.claudeSessionId,
++	                    `Error: ${err.message || 'Unknown error'}`
++                  );
++                  this.saveSessionsToDisk();
+                   this.broadcastToSession(wsInfo.claudeSessionId, {
+                     type: 'chat_error',
+                     message: err.message || 'Unknown error',
+@@ -632,18 +824,14 @@ class TerminalServer {
+                   // Store SDK session ID for future resume
+                   if (info?.sdkSessionId) {
+                     chatSession.sdkSessionId = info.sdkSessionId;
+-                  }
+-                  // Save assistant message to history
+-                  if (assistantBlocks.length > 0) {
+-                    const assistantMsg = {
+-                      role: 'assistant',
+-                      blocks: assistantBlocks,
+-                      ts: Date.now(),
+-                      streaming: false,
+-                    };
+-                    chatSession.chatHistory.push(assistantMsg);
+-                    this.chatLogger.append(chatSession.agentName, wsInfo.claudeSessionId, assistantMsg);
+-                  }
++	                  }
++	                  // Save assistant message to history
++	                  if (assistantBlocks.length > 0) {
++	                    const assistantMsg = finalizeStreamingAssistantMessage(chatSession, assistantBlocks);
++	                    if (assistantMsg) {
++	                      this.chatLogger.append(chatSession.agentName, wsInfo.claudeSessionId, assistantMsg);
++	                    }
++	                  }
+                   this.saveSessionsToDisk();
+                   this.broadcastToSession(wsInfo.claudeSessionId, { type: 'chat_complete' });
+                   // Global notification — skip if a client is already watching this session
+@@ -663,6 +851,11 @@ class TerminalServer {
+             } catch (err) {
+               console.error('[chat_send] Error starting chat session:', err);
+               chatSession.active = false;
++              this.persistChatSystemMessage(
++                wsInfo.claudeSessionId,
++                `Error: ${err.message || String(err)}`
++              );
++              this.saveSessionsToDisk();
+               this.sendToWebSocket(wsInfo.ws, { type: 'chat_error', message: err.message || String(err) });
+             }
+           }
+@@ -683,6 +876,17 @@ class TerminalServer {
+         }
+         break;
+ 
++      case 'elicitation_response':
++        if (wsInfo.claudeSessionId && data.requestId !== undefined) {
++          this.chatBridge.respondToElicitation(
++            wsInfo.claudeSessionId,
++            data.requestId,
++            typeof data.action === 'string' ? data.action : 'accept',
++            data.content && typeof data.content === 'object' ? data.content : undefined,
++          );
++        }
++        break;
++
+       case 'resize':
+         if (wsInfo.claudeSessionId) {
+           const session = this.claudeSessions.get(wsInfo.claudeSessionId);
+@@ -723,18 +927,31 @@ class TerminalServer {
+ 
+     if (wsInfo.claudeSessionId) await this.leaveClaudeSession(wsId);
+ 
+-    wsInfo.claudeSessionId = claudeSessionId;
+-    session.connections.add(wsId);
+-    session.lastActivity = new Date();
+-    session.lastAccessed = Date.now();
+-
+-    // Restore chat history from JSONL logs if session cache is empty
+-    let chatHistory = session.chatHistory || [];
++	    wsInfo.claudeSessionId = claudeSessionId;
++	    session.connections.add(wsId);
++	    session.lastActivity = new Date();
++	    session.lastAccessed = Date.now();
++
++	    // Reconcile stale UI state: a session can be marked active from a prior turn
++	    // even when the bridge no longer has a live process/query behind it.
++	    if (session.active && !this.chatBridge.isActive(claudeSessionId)) {
++	      session.active = false;
++	      const last = Array.isArray(session.chatHistory) ? session.chatHistory[session.chatHistory.length - 1] : null;
++	      if (last?.role === 'assistant' && last?.streaming) {
++	        last.streaming = false;
++	      }
++	    }
++
++	    // Restore chat history from JSONL logs if session cache is empty
++	    let chatHistory = session.chatHistory || [];
+     if (chatHistory.length === 0 && session.agentName && session.mode === 'chat') {
+       const restored = this.chatLogger.read(session.agentName, claudeSessionId);
+       if (restored.length > 0) {
+         session.chatHistory = restored;
+         chatHistory = restored;
++        if (restored.hadLegacyAttachmentPayload) {
++          session.sdkSessionId = null;
++        }
+         if (this.dev) console.log(`[chat-logger] Restored ${restored.length} messages for session ${claudeSessionId}`);
+       }
+     }
+@@ -895,6 +1112,21 @@ class TerminalServer {
+     this.webSocketConnections.delete(wsId);
+   }
+ 
++  persistChatSystemMessage(sessionId, text) {
++    const session = this.claudeSessions.get(sessionId);
++    if (!session || !session.agentName) return;
++    if (!session.chatHistory) session.chatHistory = [];
++
++    const last = session.chatHistory[session.chatHistory.length - 1];
++    if (last?.role === 'system' && last?.text === text) {
++      return;
++    }
++
++    const systemMsg = buildChatSystemMessage(text);
++    session.chatHistory.push(systemMsg);
++    this.chatLogger.append(session.agentName, sessionId, systemMsg);
++  }
++
+   close() {
+     this.saveSessionsToDisk();
+     if (this.autoSaveInterval) clearInterval(this.autoSaveInterval);
+diff --git a/dashboard/terminal-server/src/utils/chat-logger.js b/dashboard/terminal-server/src/utils/chat-logger.js
+index c2db762..67a91bf 100644
+--- a/dashboard/terminal-server/src/utils/chat-logger.js
++++ b/dashboard/terminal-server/src/utils/chat-logger.js
+@@ -17,6 +17,37 @@ const fs = require('fs');
+ const path = require('path');
+ const crypto = require('crypto');
+ 
++function sanitizeFiles(files) {
++  if (!Array.isArray(files)) {
++    return { files: undefined, hadLegacyPayload: false };
++  }
++
++  let hadLegacyPayload = false;
++  const sanitized = files.map((file) => {
++    if (file && (file.base64 || file.path)) {
++      hadLegacyPayload = true;
++    }
++    return {
++      name: file?.name,
++      type: file?.type,
++      previewUrl: file?.previewUrl,
++    };
++  });
++
++  return { files: sanitized, hadLegacyPayload };
++}
++
++function sanitizeMessage(message) {
++  const fileInfo = sanitizeFiles(message?.files);
++  return {
++    message: {
++      ...message,
++      files: fileInfo.files,
++    },
++    hadLegacyPayload: fileInfo.hadLegacyPayload,
++  };
++}
++
+ class ChatLogger {
+   constructor(workspaceRoot) {
+     this.logsDir = path.join(workspaceRoot || process.cwd(), 'workspace', 'ADWs', 'logs', 'chat');
+@@ -42,13 +73,15 @@ class ChatLogger {
+    */
+   append(agentName, sessionId, message) {
+     try {
+-      if (!message.uuid) {
+-        message.uuid = crypto.randomUUID();
++      const sanitized = sanitizeMessage(message);
++      const entry = sanitized.message;
++      if (!entry.uuid) {
++        entry.uuid = crypto.randomUUID();
+       }
+       const logPath = this._logPath(agentName, sessionId);
+-      const line = JSON.stringify(message) + '\n';
++      const line = JSON.stringify(entry) + '\n';
+       fs.appendFileSync(logPath, line, 'utf8');
+-      return message.uuid;
++      return entry.uuid;
+     } catch (err) {
+       console.error(`[chat-logger] Failed to append: ${err.message}`);
+       return null;
+@@ -106,6 +139,7 @@ class ChatLogger {
+ 
+       // Second pass: play forward, applying rewind markers
+       const messages = [];
++      let hadLegacyPayload = false;
+       for (const entry of rawLines) {
+         if (entry.type === 'rewind') {
+           // Drop the message with entry.at uuid AND everything after it
+@@ -115,10 +149,15 @@ class ChatLogger {
+           }
+           // If uuid not found (e.g. marker for already-rewound content), no-op
+         } else {
+-          messages.push(entry);
++          const sanitized = sanitizeMessage(entry);
++          if (sanitized.hadLegacyPayload) {
++            hadLegacyPayload = true;
++          }
++          messages.push(sanitized.message);
+         }
+       }
+ 
++      messages.hadLegacyAttachmentPayload = hadLegacyPayload;
+       return messages;
+     } catch (err) {
+       console.error(`[chat-logger] Failed to read: ${err.message}`);
+diff --git a/dashboard/terminal-server/src/utils/session-store.js b/dashboard/terminal-server/src/utils/session-store.js
+index 8889a19..3f55138 100644
+--- a/dashboard/terminal-server/src/utils/session-store.js
++++ b/dashboard/terminal-server/src/utils/session-store.js
+@@ -2,11 +2,57 @@ const fs = require('fs').promises;
+ const path = require('path');
+ const os = require('os');
+ 
++const WORKSPACE_ROOT = path.resolve(__dirname, '..', '..', '..', '..');
++
++function sanitizeFiles(files) {
++    if (!Array.isArray(files)) {
++        return { files: undefined, hadLegacyPayload: false };
++    }
++
++    let hadLegacyPayload = false;
++    const sanitized = files.map((file) => {
++        if (file && (file.base64 || file.path)) {
++            hadLegacyPayload = true;
++        }
++        return {
++            name: file?.name,
++            type: file?.type,
++            previewUrl: file?.previewUrl,
++        };
++    });
++
++    return { files: sanitized, hadLegacyPayload };
++}
++
++function sanitizeChatHistory(chatHistory, sessionId) {
++    let hadLegacyPayload = false;
++    const sanitized = (chatHistory || []).map((msg, i) => {
++        const fileInfo = sanitizeFiles(msg?.files);
++        if (fileInfo.hadLegacyPayload) {
++            hadLegacyPayload = true;
++        }
++
++        const normalized = {
++            ...msg,
++            files: fileInfo.files,
++        };
++        if (!normalized.uuid) {
++            normalized.uuid = `legacy-${sessionId}-${i}`;
++        }
++        return normalized;
++    });
++
++    return { chatHistory: sanitized, hadLegacyPayload };
++}
++
+ class SessionStore {
+     constructor() {
+-        // Store sessions in user's home directory
+-        this.storageDir = path.join(os.homedir(), '.claude-code-web');
++        // Prefer a workspace-shared location so backend + terminal-server
++        // running in different environments still see the same persisted chat usage.
++        this.storageDir = path.join(WORKSPACE_ROOT, '.claude-code-web');
+         this.sessionsFile = path.join(this.storageDir, 'sessions.json');
++        this.legacyStorageDir = path.join(os.homedir(), '.claude-code-web');
++        this.legacySessionsFile = path.join(this.legacyStorageDir, 'sessions.json');
+         this.initializeStorage();
+     }
+ 
+@@ -14,18 +60,26 @@ class SessionStore {
+         try {
+             // Create storage directory if it doesn't exist
+             await fs.mkdir(this.storageDir, { recursive: true });
++            await fs.mkdir(this.legacyStorageDir, { recursive: true });
+         } catch (error) {
+             console.error('Failed to create storage directory:', error);
+         }
+     }
+ 
+     async saveSessions(sessions) {
++        let tempFile = null;
+         try {
+             // Ensure storage directory exists
+             await fs.mkdir(this.storageDir, { recursive: true });
++            await fs.mkdir(this.legacyStorageDir, { recursive: true });
+             
+             // Convert Map to array for JSON serialization
+-            const sessionsArray = Array.from(sessions.entries()).map(([id, session]) => ({
++            const sessionsArray = Array.from(sessions.entries()).map(([id, session]) => {
++                const sanitizedHistory = sanitizeChatHistory(
++                    Array.isArray(session.chatHistory) ? session.chatHistory.slice(-50) : [],
++                    id
++                );
++                return {
+                 id,
+                 name: session.name || 'Unnamed Session',
+                 created: session.created || new Date(),
+@@ -38,7 +92,7 @@ class SessionStore {
+                 lastAccessed: session.lastAccessed || Date.now(),
+                 // Chat mode data
+                 mode: session.mode || null,
+-                chatHistory: Array.isArray(session.chatHistory) ? session.chatHistory.slice(-50) : [], // Keep last 50 messages
++                chatHistory: sanitizedHistory.chatHistory, // Keep last 50 messages
+                 sdkSessionId: session.sdkSessionId || null,
+                 // Ticket binding (Feature 1.3)
+                 ticketId: session.ticketId || null,
+@@ -54,7 +108,8 @@ class SessionStore {
+                     totalCost: 0,
+                     models: {}
+                 }
+-            }));
++            };
++            });
+ 
+             const data = {
+                 version: '1.0',
+@@ -63,15 +118,23 @@ class SessionStore {
+             };
+ 
+             // Write to a temporary file first, then rename (atomic operation)
+-            const tempFile = `${this.sessionsFile}.tmp`;
++            tempFile = `${this.sessionsFile}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+             await fs.writeFile(tempFile, JSON.stringify(data, null, 2));
+             // Ensure directory still exists before rename (handles race conditions)
+             await fs.mkdir(this.storageDir, { recursive: true });
+             await fs.rename(tempFile, this.sessionsFile);
++            await fs.writeFile(this.legacySessionsFile, JSON.stringify(data, null, 2));
+             
+             return true;
+         } catch (error) {
+             console.error('Failed to save sessions:', error.message);
++            if (tempFile) {
++                try {
++                    await fs.unlink(tempFile);
++                } catch {
++                    // Ignore temp cleanup errors
++                }
++            }
+             return false;
+         }
+     }
+@@ -79,9 +142,15 @@ class SessionStore {
+     async loadSessions() {
+         try {
+             // Check if sessions file exists
+-            await fs.access(this.sessionsFile);
++            let sourceFile = this.sessionsFile;
++            try {
++                await fs.access(sourceFile);
++            } catch {
++                sourceFile = this.legacySessionsFile;
++                await fs.access(sourceFile);
++            }
+             
+-            const data = await fs.readFile(this.sessionsFile, 'utf8');
++            const data = await fs.readFile(sourceFile, 'utf8');
+             
+             // Check if file is empty or just whitespace
+             if (!data || !data.trim()) {
+@@ -126,13 +195,7 @@ class SessionStore {
+             for (const session of parsed.sessions) {
+                 if (!session || !session.id) continue; // Skip invalid sessions
+                 
+-                // Synthesize uuids for legacy chatHistory entries that lack them
+-                const chatHistory = (session.chatHistory || []).map((msg, i) => {
+-                    if (!msg.uuid) {
+-                        return { ...msg, uuid: `legacy-${session.id}-${i}` };
+-                    }
+-                    return msg;
+-                });
++                const sanitizedHistory = sanitizeChatHistory(session.chatHistory || [], session.id);
+ 
+                 // Restore session with default values for runtime properties
+                 sessions.set(session.id, {
+@@ -144,11 +207,18 @@ class SessionStore {
+                     outputBuffer: session.outputBuffer || [],
+                     maxBufferSize: 1000,
+                     // Restore chat data
+-                    chatHistory,
+-                    sdkSessionId: session.sdkSessionId || null,
++                    chatHistory: sanitizedHistory.chatHistory,
++                    sdkSessionId: sanitizedHistory.hadLegacyPayload ? null : (session.sdkSessionId || null),
+                     mode: session.mode || null,
+                     // Restore usage data if available
+-                    usageData: session.usageData || null
++                    sessionUsage: session.sessionUsage || {
++                        requests: 0,
++                        inputTokens: 0,
++                        outputTokens: 0,
++                        cacheTokens: 0,
++                        totalCost: 0,
++                        models: {}
++                    }
+                 });
+             }
+ 
+@@ -199,4 +269,4 @@ class SessionStore {
+     }
+ }
+ 
+-module.exports = SessionStore;
+\ No newline at end of file
++module.exports = SessionStore;
+diff --git a/docs/openclaude-dashboard-handoff-2026-04-21.md b/docs/openclaude-dashboard-handoff-2026-04-21.md
+new file mode 100644
+index 0000000..2c6f0e9
+--- /dev/null
++++ b/docs/openclaude-dashboard-handoff-2026-04-21.md
+@@ -0,0 +1,530 @@
++# OpenClaude no Dashboard - Handoff de 2026-04-21
++
++## Objetivo
++
++Integrar o `openclaude` ao chat do EvoNexus de forma o mais nativa possivel, replicando o comportamento do caminho atual do Claude no dashboard, sem depender do uso manual do terminal.
++
++O foco deste ciclo foi fazer o fluxo de chat funcionar com:
++
++- sessao no dashboard
++- contexto conversacional entre turnos
++- reconhecimento do agent `oracle`
++- uso de ferramentas via CLI
++- pedidos reais de aprovacao com botoes `Allow` / `Deny`
++
++## Estado atual
++
++### O que ja avancou bem
++
++1. O dashboard ja consegue usar o caminho CLI do `openclaude` em vez de cair apenas no Claude nativo.
++2. O agent `oracle` voltou a ser reconhecido via `--agent oracle`.
++3. O contexto entre mensagens esta melhor do que estava antes.
++4. Os anexos deixaram de explodir o processo por causa de payload gigante em historico.
++5. Os pedidos de aprovacao agora aparecem na UI com botoes reais.
++6. O fluxo de aprovacao para ferramentas sensiveis deu um salto importante:
++   - antes o agente pedia permissao em texto, mas nao havia callback real
++   - agora ja existe card visual com `Allow` / `Deny`
++7. O servidor nao esta mais fechando o stdin cedo demais no caminho CLI, o que era um bloqueio para aprovacoes mid-turn.
++
++### O que foi observado hoje na UI
++
++No teste mais recente, apareceu pela primeira vez um pedido real de aprovacao no chat, com botao clicavel para `Bash`.
++
++Isso mostra que a ponte entre dashboard e OpenClaude melhorou bastante e que a integracao de permissao deixou de ser apenas "texto fingindo aprovacao".
++
++Tambem apareceu uma chamada de `AskUserQuestion`, com um payload estruturado contendo:
++
++- `questions`
++- `header`
++- `options`
++- `multiSelect`
++- `metadata`
++
++Isso e um sinal importante de maturidade da integracao: o modelo nao apenas respondeu em texto, ele tentou usar um mecanismo estruturado de coleta de resposta do usuario.
++
++## Principais problemas que ainda restam
++
++### 1. `AskUserQuestion` ainda nao esta ligado a uma UI nativa
++
++Hoje o OpenClaude conseguiu emitir algo como:
++
++- `AskUserQuestion`
++- com JSON estruturado para perguntas e opcoes
++
++Mas o dashboard ainda nao esta tratando isso como um componente interativo proprio. O resultado pratico foi:
++
++- a ferramenta apareceu como bloco tecnico
++- depois o assistente caiu para uma resposta em texto pedindo as mesmas informacoes manualmente
++
++Interpretacao:
++
++- o backend ja esta recebendo ou expondo a chamada da ferramenta
++- mas o frontend ainda nao tem o fluxo nativo para renderizar essa solicitacao como formulario/pergunta clicavel
++
++Esse provavelmente e o proximo grande passo de UX.
++
++### 2. Fluxo de imagem ainda nao e multimodal de verdade
++
++Embora o anexo de arquivo esteja funcionando melhor, o caminho atual do `openclaude` no modo CLI ainda nao se comporta como "visao nativa" de imagem no nivel que o Claude nativo faz no dashboard.
++
++Sinais disso:
++
++- leituras de PNG/JPG podem cair em uso de `Read`, o que nao garante entendimento visual real
++- em testes anteriores, a descricao retornada nao batia com a imagem enviada
++
++Conclusao:
++
++- anexo existe e serve para fluxo de arquivos
++- mas visao real de imagem ainda nao esta resolvida neste caminho
++
++### 3. Ha comportamentos de ferramenta que ainda parecem "tecnicos demais" para a UX do dashboard
++
++Exemplo visto hoje:
++
++- `Bash` apareceu com comando detalhado
++- `AskUserQuestion` apareceu como payload bruto
++
++Isso e util para debug, mas ainda nao parece um espelho fino do UX do caminho nativo do Claude.
++
++Provavel necessidade:
++
++- mapear melhor alguns tipos de tool call para componentes mais amigaveis no frontend
++- manter o bloco tecnico para inspeção, mas nao como unica forma de interacao
++
++## Mudancas principais feitas no codigo
++
++### Arquivo principal
++
++- [dashboard/terminal-server/src/chat-bridge.js](/abs/path/D:\ExpertSA DEV\evo-nexus\dashboard\terminal-server\src\chat-bridge.js:273)
++
++### O que foi ajustado nessa etapa
++
++1. O caminho CLI foi movido para usar `stream-json` tambem na entrada.
++2. Foi habilitado `--permission-prompt-tool stdio`.
++3. O `chat-bridge` passou a:
++   - escrever mensagem do usuario em NDJSON estruturado
++   - capturar `control_request`
++   - identificar `can_use_tool`
++   - emitir `permission_request` para a UI
++   - receber clique do usuario
++   - devolver `control_response` para o processo do OpenClaude
++4. O processo CLI agora mantem stdin aberto durante o turno, para responder aprovacoes no meio da execucao.
++5. O caminho de historico/anexos ja havia sido saneado anteriormente para remover base64 pesado do estado persistido.
++
++## Arquivos que merecem atencao amanha
++
++### Backend / ponte
++
++- [dashboard/terminal-server/src/chat-bridge.js](/abs/path/D:\ExpertSA DEV\evo-nexus\dashboard\terminal-server\src\chat-bridge.js:596)
++- [dashboard/terminal-server/src/server.js](/abs/path/D:\ExpertSA DEV\evo-nexus\dashboard\terminal-server\src\server.js:602)
++- [dashboard/terminal-server/src/utils/chat-logger.js](/abs/path/D:\ExpertSA DEV\evo-nexus\dashboard\terminal-server\src\utils\chat-logger.js:1)
++- [dashboard/terminal-server/src/utils/session-store.js](/abs/path/D:\ExpertSA DEV\evo-nexus\dashboard\terminal-server\src\utils\session-store.js:1)
++
++### Frontend / UX do chat
++
++- [dashboard/frontend/src/components/AgentChat.tsx](/abs/path/D:\ExpertSA DEV\evo-nexus\dashboard\frontend\src\components\AgentChat.tsx:197)
++
++## Pontos ja confirmados por observacao
++
++### Confirmado como funcionando
++
++- reconhecimento do `oracle`
++- retomada melhor de contexto entre turnos
++- card de aprovacao com `Allow` / `Deny`
++- tool calls aparecendo no chat
++- progresso interno com `TodoWrite`
++- uso de `Glob` e `Bash` no fluxo de trabalho
++
++### Confirmado como ainda incompleto
++
++- UI nativa para `AskUserQuestion`
++- multimodal real para imagens no caminho OpenClaude CLI
++- paridade fina de UX com o Claude nativo
++
++## Hipotese forte para o proximo passo
++
++O proximo salto nao parece mais ser "fazer o OpenClaude responder".
++
++Esse ponto ja foi em grande parte vencido.
++
++O proximo salto parece ser "dar forma nativa na UI para os eventos estruturados que ele ja esta emitindo".
++
++Os dois eventos mais importantes agora sao:
++
++1. `permission_request`
++2. `AskUserQuestion`
++
++Se esses dois fluxos ficarem bem resolvidos, a experiencia deve se aproximar muito mais do caminho nativo.
++
++## Proximos passos recomendados
++
++### Passo 1 - mapear `AskUserQuestion` de ponta a ponta
++
++Objetivo:
++
++- descobrir exatamente como essa chamada chega no `chat-bridge` e no `AgentChat`
++- decidir se ela esta vindo como `tool_use`, `assistant`, `tool_result` ou outro tipo intermediario
++
++Perguntas para responder:
++
++- o backend ja recebe um evento estruturado suficiente para renderizar formulario?
++- ou sera preciso transformar o payload antes de mandar para o frontend?
++- qual e o formato minimo necessario para a UI renderizar:
++  - pergunta
++  - opcoes
++  - escolha unica ou multipla
++  - envio da resposta de volta
++
++### Passo 2 - criar UI nativa para `AskUserQuestion`
++
++Objetivo:
++
++- quando o OpenClaude emitir esse tipo de ferramenta, mostrar um componente amigavel no chat
++
++UX desejada:
++
++- titulo curto
++- perguntas com botoes/opcoes clicaveis
++- envio da resposta estruturada de volta ao agente
++- fallback para texto apenas se a UI falhar
++
++### Passo 3 - revisar o comportamento de leitura de imagem
++
++Objetivo:
++
++- definir claramente o limite real do caminho OpenClaude atual
++
++Cenarios a testar:
++
++1. anexo de txt e leitura
++2. anexo de png e descricao visual
++3. anexo de png e copia/movimentacao para pasta do projeto
++4. anexo de png com acao de escrita em arquivo markdown
++
++Resultado esperado desse passo:
++
++- separar o que e "arquivo anexado" do que e "visao multimodal"
++- documentar para nao gerar falsa expectativa
++
++### Passo 4 - reduzir exposicao de payload tecnico quando houver UX melhor
++
++Objetivo:
++
++- deixar a interface mais parecida com o uso nativo do Claude
++
++Exemplos:
++
++- `AskUserQuestion` deve virar formulario, nao bloco bruto JSON
++- permissao pode manter card tecnico, mas com linguagem mais limpa
++
++### Passo 5 - rodada de regressao
++
++Rodar testes manuais com pelo menos estes cenarios:
++
++1. conversa simples em varias mensagens
++2. agent `oracle` respondendo como persona correta
++3. pedido de `Bash` com `Allow`
++4. pedido de `Bash` com `Deny`
++5. `AskUserQuestion` com resposta do usuario
++6. anexo de txt
++7. anexo de imagem
++8. escrita em `workspace/courses`
++
++## Sugestao de roteiro para retomar amanha
++
++1. Abrir este documento.
++2. Reproduzir o caso de `AskUserQuestion`.
++3. Inspecionar no backend qual mensagem chega do OpenClaude nesse ponto.
++4. Mapear no frontend onde renderizar esse evento.
++5. Implementar um componente simples de perguntas com opcoes.
++6. Testar resposta estruturada voltando para o chat.
++7. So depois voltar para multimodal de imagem.
++
++## Pergunta estrategica em aberto
++
++Existe uma pergunta importante para responder depois, antes de pensar em distribuicao externa:
++
++Como empacotar essa integracao do OpenClaude como algo distribuivel, sem precisar distribuir o "problema inteiro" do dashboard?
++
++Em outras palavras:
++
++- da para transformar isso em um addon?
++- da para virar um modulo isolado?
++- da para empacotar como plugin, bridge, sidecar ou adaptador?
++- quais partes hoje estao acopladas demais ao EvoNexus e precisariam ser extraidas?
++
++Essa pergunta nao foi respondida ainda neste ciclo, mas deve entrar na proxima rodada de analise arquitetural.
++
++### Quando responder essa pergunta
++
++Idealmente depois que os dois fluxos mais importantes estiverem estaveis:
++
++1. `permission_request`
++2. `AskUserQuestion`
++
++So depois disso vai ficar mais claro quais contratos realmente precisam existir entre:
++
++- frontend
++- terminal-server
++- backend
++- processo `openclaude`
++
++### O que investigar quando formos responder
++
++1. O que hoje e especifico do EvoNexus e o que e reutilizavel.
++2. Se a integracao pode ser separada em uma camada de protocolo:
++   - entrada de mensagens
++   - saida de eventos
++   - aprovacoes
++   - perguntas estruturadas
++   - anexos
++3. Se o empacotamento ideal seria:
++   - biblioteca Node
++   - microservico/sidecar
++   - plugin do dashboard
++   - adaptador de provedor
++4. Quais dependencias de estado persistido precisam ser desacopladas:
++   - sessoes
++   - logs
++   - historico
++   - custo/uso
++5. Se a UI poderia consumir um contrato generico em vez de detalhes internos do OpenClaude.
++
++## Resumo executivo
++
++Hoje o projeto saiu de um estado em que o OpenClaude:
++
++- respondia parcialmente
++- quebrava fluxo de permissao
++- nao sustentava bem o ciclo interativo
++
++para um estado em que ele:
++
++- conversa no dashboard
++- reconhece o agent
++- mantem melhor o contexto
++- emite pedidos reais de aprovacao
++- ja mostra sinais de ferramentas mais avancadas como `AskUserQuestion`
++
++O maior gargalo agora deixou de ser a execucao basica do OpenClaude e passou a ser a paridade de UX com o Claude nativo.
++
++Em outras palavras:
++
++- o motor esta bem mais perto de funcionar
++- a camada de experiencia ainda precisa acompanhar
++
++## Checklist de regressao
++
++Esta secao passa a ser o roteiro padrao para validar se a integracao OpenClaude no dashboard continua saudavel depois de ajustes em:
++
++- `chat-bridge`
++- `server.js`
++- `AgentChat`
++- `AgentDetail`
++- `Overview`
++- `Agents`
++- persistencia de sessoes
++- fluxo de aprovacao e trust
++
++### Ordem recomendada de execucao
++
++1. Validar criacao de sessao e primeiro envio.
++2. Validar historico, retorno e refresh.
++3. Validar `trust` e aprovacoes.
++4. Validar `AskUserQuestion`.
++5. Validar indicadores globais (`Overview`, `Agents`, custos, ativos).
++6. Validar delete, arquivamento e restart do terminal-server.
++
++### Cenarios obrigatorios
++
++#### 1. Entrada no agente sem sessao automatica
++
++Passos:
++
++1. Abrir `Agents > Oracle`.
++2. Garantir que nao existe sessao anterior.
++
++Esperado:
++
++- `SESSIONS 0`
++- nenhuma conversa nova nasce so por entrar na tela
++- a area principal fica vazia, pronta para comecar
++
++#### 2. Primeira mensagem cria a sessao
++
++Passos:
++
++1. Entrar em `Oracle` sem sessao.
++2. Mandar uma mensagem simples como `ola`.
++
++Esperado:
++
++- a sessao nasce apenas no primeiro envio
++- a mensagem nao some
++- nao e preciso digitar duas vezes
++- a nova sessao aparece na lateral com timestamp atual
++
++#### 3. Sessao atualiza em tempo real
++
++Passos:
++
++1. Pedir uma tarefa que use ferramentas e leve alguns segundos.
++2. Observar a lateral durante a execucao.
++
++Esperado:
++
++- a sessao sobe para o topo
++- o preview muda para refletir a ultima atividade relevante
++- o estado visual mostra execucao enquanto o turno roda
++- ao terminar, o estado volta sozinho para inativo
++
++#### 4. Voltar para a tela sem perder historico
++
++Passos:
++
++1. Iniciar uma conversa.
++2. Sair para outra pagina do dashboard.
++3. Voltar para o agente.
++
++Esperado:
++
++- a sessao continua listada
++- o historico reaparece
++- a sessao correta segue selecionavel
++- o status da sessao permanece coerente
++
++#### 5. Refresh da pagina
++
++Passos:
++
++1. Com uma conversa existente, dar refresh no navegador.
++2. Reabrir o agente.
++
++Esperado:
++
++- o historico volta
++- a sessao nao desaparece
++- nao ocorre tela em branco nem crash de React
++
++#### 6. Delete de sessao
++
++Passos:
++
++1. Deletar uma sessao existente.
++2. Observar a lateral e a area principal.
++
++Esperado:
++
++- a sessao some da lista
++- se era a unica, a tela volta para `SESSIONS 0`
++- o sistema nao recria sessao fantasma automaticamente
++
++#### 7. Restart do terminal-server
++
++Passos:
++
++1. Encerrar `dashboard/terminal-server`.
++2. Subir novamente com `npm run dev`.
++3. Voltar ao dashboard.
++
++Esperado:
++
++- sessoes persistidas reais voltam
++- sessoes deletadas nao reaparecem
++- chats vazios nao nascem so por abrir a pagina
++
++#### 8. `Trust` ligado
++
++Passos:
++
++1. Ativar `Settings > Trust`.
++2. Pedir uma tarefa que use `Bash`, `Write` ou `Edit`.
++
++Esperado:
++
++- o agente segue sem pedir `Allow / Deny`
++- especialmente no caminho `openclaude` via CLI
++
++#### 9. `Trust` desligado
++
++Passos:
++
++1. Desativar `Trust`.
++2. Repetir uma tarefa mutavel.
++
++Esperado:
++
++- aparece o card de aprovacao
++- `Allow` continua o fluxo
++- `Deny` bloqueia o passo e o agente reage corretamente
++
++#### 10. `AskUserQuestion`
++
++Passos:
++
++1. Forcar um fluxo em que o agente precise perguntar algo estruturado.
++2. Responder pelo card.
++
++Esperado:
++
++- a pergunta aparece em UI propria
++- a resposta volta de forma estruturada
++- nao e enviada mensagem textual workaround do tipo `Aqui estao minhas respostas...`
++- o agente continua normalmente depois da resposta
++
++#### 11. Indicadores globais
++
++Passos:
++
++1. Enquanto o `Oracle` estiver rodando, abrir `Overview`.
++2. Abrir tambem `Agents`.
++
++Esperado:
++
++- `Overview` mostra o agente ativo
++- a pagina `Agents` mostra o card do agente como `RUNNING`
++- o contador `active` da pagina `Agents` bate com o estado real
++- quando o turno acaba, o estado de execucao some sozinho
++
++#### 12. Custos
++
++Passos:
++
++1. Rodar alguns turnos de chat.
++2. Conferir `Overview` e `Costs`.
++
++Esperado:
++
++- custo de chat aparece agregado
++- `Overview` e `Costs` nao se contradizem
++- deletar uma sessao remove a contribuicao dela do total atual, porque hoje o custo e baseado nas sessoes persistidas
++
++### Baseline atual esperada
++
++Neste momento, o comportamento esperado do sistema e:
++
++- abrir agente nao cria sessao automaticamente
++- a primeira mensagem cria a sessao
++- historico volta em refresh e retorno de tela
++- `Trust` funciona tambem no caminho `openclaude`
++- `AskUserQuestion` responde por fluxo estruturado
++- `Overview` e `Agents` conseguem enxergar agentes ativos
++- sessao de chat nao deve continuar como `running` apos o turno realmente terminar
++
++### O que considerar falha critica
++
++Se qualquer item abaixo acontecer, a regressao deve ser tratada como bloqueadora:
++
++- a primeira mensagem some no momento de criar a sessao
++- a conversa reaparece vazia ao voltar para a tela
++- o chat cai para tela branca / crash de React
++- `Trust` ligado continua pedindo aprovacao
++- `AskUserQuestion` volta a depender de mensagem textual workaround
++- agente permanece `running` indefinidamente depois do fim do turno
++- `Overview` e `Agents` divergem sobre quem esta ativo
++
++### Sugestao de uso deste checklist
++
++- Rodar toda a lista antes de fechar um ciclo maior.
++- Rodar ao menos os itens `1, 2, 6, 8, 10 e 11` sempre que houver mudanca em `chat-bridge`, `server.js`, `AgentChat` ou `AgentDetail`.
++- Atualizar esta secao sempre que um novo comportamento sensivel entrar no fluxo.
+diff --git a/start-services.sh b/start-services.sh
+index b5ee194..65446b6 100755
+--- a/start-services.sh
++++ b/start-services.sh
+@@ -1,26 +1,18 @@
+ #!/bin/bash
+ export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+-cd /home/evonexus/evo-nexus
++cd /mnt/d/ExpertSA DEV/evo-nexus
+ 
+-# Load environment variables
+-if [ -f .env ]; then
+-  set -a
+-  source .env
+-  set +a
+-fi
+-
+-# Kill existing services (including scheduler)
++# Kill existing services
+ pkill -f 'terminal-server/bin/server.js' 2>/dev/null
+-pkill -f 'python.*app.py' 2>/dev/null
+-pkill -f 'python.*scheduler.py' 2>/dev/null
++pkill -f 'dashboard/backend.*app.py' 2>/dev/null
+ sleep 1
+ 
+-# Start terminal-server (must run FROM the project root for agent discovery)
+-nohup node dashboard/terminal-server/bin/server.js > /home/evonexus/evo-nexus/logs/terminal-server.log 2>&1 &
++# Clean stale sessions — old sessions cause agent persona issues
++rm -f $HOME/.claude-code-web/sessions.json 2>/dev/null
+ 
+-# Start scheduler
+-nohup /home/evonexus/evo-nexus/.venv/bin/python scheduler.py > /home/evonexus/evo-nexus/logs/scheduler.log 2>&1 &
++# Start terminal-server (must run FROM the project root for agent discovery)
++nohup node dashboard/terminal-server/bin/server.js > /mnt/d/ExpertSA DEV/evo-nexus/logs/terminal-server.log 2>&1 &
+ 
+ # Start Flask dashboard
+ cd dashboard/backend
+-nohup /home/evonexus/evo-nexus/.venv/bin/python app.py > /home/evonexus/evo-nexus/logs/dashboard.log 2>&1 &
++nohup /mnt/d/ExpertSA DEV/evo-nexus/.venv/bin/python app.py > /mnt/d/ExpertSA DEV/evo-nexus/logs/dashboard.log 2>&1 &
+-- 
+2.53.0.windows.1
+
