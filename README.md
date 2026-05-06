@@ -165,7 +165,7 @@ The setup wizard asks which provider you want during `make setup`, and you can s
 The fastest way. Pulls official multi-arch images (`linux/amd64` + `linux/arm64`) from Docker Hub — works natively on Apple Silicon, AWS Graviton, Oracle ARM, Raspberry Pi, and x86_64 servers.
 
 ```bash
-curl -O https://raw.githubusercontent.com/EvolutionAPI/evo-nexus/main/docker-compose.hub.yml
+curl -O https://raw.githubusercontent.com/evolution-foundation/evo-nexus/main/docker-compose.hub.yml
 docker compose -f docker-compose.hub.yml up -d
 open http://localhost:8080
 ```
@@ -183,7 +183,7 @@ This downloads and runs the interactive setup wizard automatically. Requires the
 ### Method 3 — Manual clone (for developers / contributors)
 
 ```bash
-git clone --depth 1 https://github.com/EvolutionAPI/evo-nexus.git
+git clone --depth 1 https://github.com/evolution-foundation/evo-nexus.git
 cd evo-nexus
 
 # Interactive setup wizard — checks prerequisites, creates config files
