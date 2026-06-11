@@ -34,6 +34,32 @@ def _cleanup_staging(staging: Path) -> None:
         log.warning("restore: could not clean staging dir %s: %s", staging, exc)
 
 
+def _clear_directory_contents(path: Path) -> None:
+    """Remove everything inside path without removing path itself.
+
+    Docker bind mounts and named volumes cannot always have their mount-point
+    directory removed from inside the container. Restore swaps therefore clear
+    the contents and keep the root directory in place.
+    """
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def _replace_directory_tree(src: Path, dest: Path) -> None:
+    """Replace dest contents with src while preserving an existing dest root."""
+    if dest.exists():
+        if dest.is_dir() and not dest.is_symlink():
+            _clear_directory_contents(dest)
+            shutil.copytree(str(src), str(dest), dirs_exist_ok=True)
+            return
+        dest.unlink()
+
+    shutil.copytree(str(src), str(dest))
+
+
 def execute_restore(
     repo_url: str,
     ref: str,
@@ -172,9 +198,7 @@ def execute_restore(
             if not src.exists():
                 log.debug("restore swap: %s not in staging, skipping", d)
                 continue
-            if dest.exists():
-                shutil.rmtree(dest, ignore_errors=True)
-            shutil.copytree(str(src), str(dest))
+            _replace_directory_tree(src, dest)
         yield _event("swap", 75, "Swap complete")
     except Exception as exc:
         yield _event("swap", 75, f"Swap failed: {exc}", error=True)
