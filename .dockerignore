@@ -3,7 +3,13 @@
 .env
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 dashboard/data/
+dashboard/frontend/dist/
+dashboard/frontend/node_modules/
+dashboard/terminal-server/node_modules/
 workspace/
 ADWs/logs/
 ADWs/__pycache__/
@@ -12,5 +18,7 @@ ADWs/__pycache__/
 etus-boilerplate-agentic-engineer/
 social-media-skills/
 node_modules/
+**/node_modules/
 .DS_Store
 *.zip
+geraimg
