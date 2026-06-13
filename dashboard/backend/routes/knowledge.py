@@ -410,12 +410,13 @@ def parser_install():
     Idempotent — returns "already_installed" if sentinel exists.
     """
     _assert_key()
-    from knowledge.parser_install import download_marker_models
+    from knowledge.parser_install import start_marker_model_install
     from knowledge.parsers.marker_parser import MarkerNotInstalledError
 
     try:
-        result = download_marker_models()
-        return jsonify(result)
+        result = start_marker_model_install()
+        status_code = 202 if result.get("status") == "installing" else 200
+        return jsonify(result), status_code
     except MarkerNotInstalledError as exc:
         return jsonify({"error": str(exc)}), 422
     except Exception as exc:

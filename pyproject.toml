@@ -33,6 +33,7 @@ dependencies = [
     "jsonschema>=4.21",
     "flask-limiter>=3.5",
     "websocket-client>=1.7",
+    "mempalace>=0.1",
 ]
 
 [project.scripts]

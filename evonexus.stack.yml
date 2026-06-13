@@ -53,9 +53,13 @@ services:
         constraints:
           - node.role == manager
       resources:
+        ## The dashboard runs Flask + the Node terminal-server + one `claude`
+        ## process per open chat session. A single Claude Code session can
+        ## use 0.5-1.5GB RSS, so a tight limit gets the process OOM-killed
+        ## (SIGKILL) mid-conversation and restarts the whole container.
         limits:
-          cpus: "1"
-          memory: 1024M
+          cpus: "2"
+          memory: 6144M
       labels:
         - traefik.enable=1
         - traefik.docker.network=traefik-public
@@ -118,9 +122,10 @@ services:
         constraints:
           - node.role == manager
       resources:
+        ## Runs a long-lived `claude` process for the Telegram channel.
         limits:
-          cpus: "1"
-          memory: 1024M
+          cpus: "2"
+          memory: 3072M
 
   evonexus_scheduler:
     image: evoapicloud/evo-nexus-runtime:latest
@@ -146,9 +151,11 @@ services:
         constraints:
           - node.role == manager
       resources:
+        ## Routines and heartbeats can spawn `claude` subprocesses, sometimes
+        ## in parallel — size for at least two concurrent sessions.
         limits:
-          cpus: "1"
-          memory: 1024M
+          cpus: "2"
+          memory: 4096M
 
 volumes:
   evonexus_config:

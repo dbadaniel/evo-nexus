@@ -20,6 +20,10 @@ interface ParserStatus {
   marker_installed: boolean
   marker_version?: string
   install_path?: string
+  install_state?: 'idle' | 'installing' | 'installed' | 'error'
+  install_stage?: string | null
+  install_progress?: number
+  install_error?: string | null
 }
 
 interface EmbedderModel {
@@ -116,6 +120,34 @@ export default function KnowledgeSettings() {
   useEffect(() => { load() }, [load])
 
   useEffect(() => {
+    if (parserStatus?.install_state !== 'installing') return
+
+    setInstalling(true)
+    const timer = window.setInterval(async () => {
+      try {
+        const status = await api.get('/knowledge/parsers/status')
+        setParserStatus(status)
+        if (status.marker_installed || status.install_state === 'installed') {
+          setInstallDone(true)
+          setInstalling(false)
+          window.clearInterval(timer)
+          await load()
+        } else if (status.install_state === 'error') {
+          setError(status.install_error || 'Install failed')
+          setInstalling(false)
+          window.clearInterval(timer)
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to check install status')
+        setInstalling(false)
+        window.clearInterval(timer)
+      }
+    }, 3000)
+
+    return () => window.clearInterval(timer)
+  }, [parserStatus?.install_state, load])
+
+  useEffect(() => {
     if (settings) {
       setEmbedder(settings.embedder_provider)
       setParser(settings.parser_default)
@@ -197,16 +229,24 @@ export default function KnowledgeSettings() {
     setError(null)
     try {
       const result = await api.post('/knowledge/parsers/install')
-      if (result.already_installed) {
+      if (result.status === 'already_installed') {
         setInstallDone(true)
+        setInstalling(false)
+      } else if (result.status === 'installing') {
+        setParserStatus((prev) => ({
+          ...(prev || { marker_installed: false }),
+          install_state: 'installing',
+          install_progress: result.progress || 0,
+        }))
       } else {
         setInstallDone(true)
+        setInstalling(false)
         await load()
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Install failed')
+      setInstalling(false)
     }
-    setInstalling(false)
   }
 
   if (loading) {
