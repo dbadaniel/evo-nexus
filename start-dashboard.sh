@@ -75,6 +75,11 @@ EOF
     fi
 fi
 
+# Redirect session storage into the claude-auth volume (/root/.claude) so
+# sessions survive container restarts. The default (~/.claude-code-web) sits
+# outside the volume and is wiped on every redeploy.
+export TERMINAL_SESSION_DIR="${TERMINAL_SESSION_DIR:-/root/.claude/.claude-code-web}"
+
 # Start terminal-server in the background
 node /workspace/dashboard/terminal-server/bin/server.js --port "${TERMINAL_PORT}" &
 TERMINAL_PID=$!

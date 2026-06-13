@@ -6,7 +6,7 @@ const os = require('os');
 class SessionStore {
     constructor(options = {}) {
         // Store sessions in user's home directory
-        this.storageDir = options.storageDir || path.join(os.homedir(), '.claude-code-web');
+        this.storageDir = options.storageDir || process.env.TERMINAL_SESSION_DIR || path.join(os.homedir(), '.claude-code-web');
         this.sessionsFile = path.join(this.storageDir, 'sessions.json');
         this.sessionTtlMs = options.sessionTtlMs ?? (24 * 60 * 60 * 1000);
         this.maxFileAgeDays = options.maxFileAgeDays ?? 7;
