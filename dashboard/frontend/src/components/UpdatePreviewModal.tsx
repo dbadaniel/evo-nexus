@@ -118,6 +118,8 @@ export default function UpdatePreviewModal({
   const [, setScanResult] = useState<ScanResult | null>(null)
   const [overrideReason, setOverrideReason] = useState<string | null>(null)
   const [confirmed, setConfirmed] = useState(false) // user confirmed WARN
+  const [skipScan, setSkipScan] = useState(false)
+  const [skipReason, setSkipReason] = useState('')
 
   const handleScanVerdict = useCallback(
     (verdict: ScanVerdict | null, result: ScanResult | null) => {
@@ -130,6 +132,11 @@ export default function UpdatePreviewModal({
 
   const handleOverride = useCallback((reason: string) => {
     setOverrideReason(reason)
+  }, [])
+
+  const handleSkipChange = useCallback((skipped: boolean, reason: string) => {
+    setSkipScan(skipped)
+    setSkipReason(reason)
   }, [])
 
   useEffect(() => {
@@ -185,9 +192,9 @@ export default function UpdatePreviewModal({
       if (scanVerdict === 'BLOCK' && overrideReason) {
         body.override_reason = overrideReason
       }
-      if (scanVerdict === null) {
-        // skip_scan was checked by admin
+      if (skipScan) {
         body.skip_scan = true
+        body.skip_reason = skipReason.trim()
       }
       await api.post(`/plugins/${slug}/update`, body)
       onApplied()
@@ -201,10 +208,12 @@ export default function UpdatePreviewModal({
 
   // Wave 2.5 — canApply depends on scan verdict
   const scanGatePassed =
-    scanVerdict === 'APPROVE' ||
-    scanVerdict === null /* skip */ ||
-    (scanVerdict === 'WARN' && confirmed) ||
-    (scanVerdict === 'BLOCK' && !!overrideReason)
+    (skipScan && skipReason.trim().length > 0) ||
+    (!skipScan && (
+      scanVerdict === 'APPROVE' ||
+      (scanVerdict === 'WARN' && confirmed) ||
+      (scanVerdict === 'BLOCK' && !!overrideReason)
+    ))
 
   const canApply = !!(
     preview &&
@@ -350,6 +359,7 @@ export default function UpdatePreviewModal({
               sourceUrl={sourceUrl}
               onVerdict={handleScanVerdict}
               onOverride={handleOverride}
+              onSkipChange={handleSkipChange}
             />
           )}
 

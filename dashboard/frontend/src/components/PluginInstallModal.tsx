@@ -44,6 +44,8 @@ export default function PluginInstallModal({ onClose, onInstalled }: Props) {
   const [, setScanResult] = useState<ScanResult | null>(null)
   const [overrideReason, setOverrideReason] = useState('')
   const [warnConfirmed, setWarnConfirmed] = useState(false)
+  const [skipScan, setSkipScan] = useState(false)
+  const [skipReason, setSkipReason] = useState('')
 
   // Effective source: uploaded staged path wins over URL input
   const effectiveSource = () => (uploadedPath ?? sourceUrl.trim())
@@ -61,11 +63,18 @@ export default function PluginInstallModal({ onClose, onInstalled }: Props) {
     setOverrideReason(reason)
   }, [])
 
+  const handleSkipChange = useCallback((skipped: boolean, reason: string) => {
+    setSkipScan(skipped)
+    setSkipReason(reason)
+  }, [])
+
   // Scan gate logic (mirrors UpdatePreviewModal):
   // null = scan not yet completed (wait) | APPROVE = pass | WARN+confirmed = pass |
   // BLOCK+overrideReason(≥20) = admin pass
   const scanGatePassed =
-    scanVerdict === null
+    skipScan
+      ? skipReason.trim().length > 0
+      : scanVerdict === null
       ? false // still scanning
       : scanVerdict === 'APPROVE'
         ? true
@@ -104,6 +113,8 @@ export default function PluginInstallModal({ onClose, onInstalled }: Props) {
     setScanResult(null)
     setOverrideReason('')
     setWarnConfirmed(false)
+    setSkipScan(false)
+    setSkipReason('')
     try {
       const body: Record<string, string> = { source_url: src }
       if (authToken.trim()) body.auth_token = authToken.trim()
@@ -129,6 +140,10 @@ export default function PluginInstallModal({ onClose, onInstalled }: Props) {
       if (scanVerdict === 'WARN' && warnConfirmed) body.confirmed_verdict = 'WARN'
       if (scanVerdict === 'BLOCK' && overrideReason.trim().length >= 20) {
         body.override_reason = overrideReason.trim()
+      }
+      if (skipScan) {
+        body.skip_scan = true
+        body.skip_reason = skipReason.trim()
       }
       const result = await api.post('/plugins/install', body) as { slug: string; mcp_servers_installed?: Array<{ effective_name: string }> }
       setInstalledSlug(result.slug)
@@ -284,6 +299,7 @@ export default function PluginInstallModal({ onClose, onInstalled }: Props) {
                 authToken={authToken.trim() || undefined}
                 onVerdict={handleScanVerdict}
                 onOverride={handleOverride}
+                onSkipChange={handleSkipChange}
               />
 
               {/* WARN confirmation checkbox */}

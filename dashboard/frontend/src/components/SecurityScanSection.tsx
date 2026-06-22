@@ -59,6 +59,8 @@ interface Props {
   onVerdict: (verdict: ScanVerdict | null, result: ScanResult | null) => void
   /** Called when admin overrides a BLOCK. */
   onOverride: (reason: string) => void
+  /** Called when an admin explicitly enables or disables scan skipping. */
+  onSkipChange?: (skipped: boolean, reason: string) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +123,13 @@ function verdictColors(v: ScanVerdict) {
 // Main component
 // ---------------------------------------------------------------------------
 
-export default function SecurityScanSection({ sourceUrl, authToken, onVerdict, onOverride }: Props) {
+export default function SecurityScanSection({
+  sourceUrl,
+  authToken,
+  onVerdict,
+  onOverride,
+  onSkipChange,
+}: Props) {
   const { user } = useAuth()
   const isAdmin = user?.role === 'admin'
 
@@ -170,7 +178,10 @@ export default function SecurityScanSection({ sourceUrl, authToken, onVerdict, o
       setResult(null)
       setError(null)
       onVerdict(null, null)
+      onSkipChange?.(true, skipReason)
     } else {
+      setSkipReason('')
+      onSkipChange?.(false, '')
       // Re-run scan when unchecked
       hasRun.current = false
       setScanning(true)
@@ -379,7 +390,10 @@ export default function SecurityScanSection({ sourceUrl, authToken, onVerdict, o
                   <div className="space-y-1">
                     <textarea
                       value={skipReason}
-                      onChange={(e) => setSkipReason(e.target.value)}
+                      onChange={(e) => {
+                        setSkipReason(e.target.value)
+                        onSkipChange?.(true, e.target.value)
+                      }}
                       rows={1}
                       placeholder="Reason for skipping (required)"
                       className="w-full bg-black/20 border border-[#344054] rounded px-2 py-1 text-[10px] text-[#D0D5DD] placeholder-[#667085] resize-none focus:outline-none focus:border-yellow-500/50"
