@@ -584,6 +584,7 @@ class ChatBridge {
       sdkSessionId: sdkSessionId || null,
     };
     this.sessions.set(sessionId, session);
+    let finalResult = null;
 
     // Run query in background
     (async () => {
@@ -601,6 +602,15 @@ class ChatBridge {
             console.log(`[chat-bridge] System message: subtype=${message.subtype}, agent=${message.agent || 'none'}, data=${JSON.stringify(message).slice(0, 200)}`);
           } else {
             console.log(`[chat-bridge] Message received: type=${message.type}${eventDetail}`);
+          }
+
+          if (message.type === 'result') {
+            finalResult = {
+              totalCost: message.total_cost_usd ?? 0,
+              usage: message.usage || null,
+              durationMs: message.duration_ms,
+              numTurns: message.num_turns,
+            };
           }
 
           // Capture SDK session ID from any message that has it
@@ -639,13 +649,13 @@ class ChatBridge {
 
         session.active = false;
         this.sessions.delete(sessionId);
-        if (onComplete) onComplete({ sdkSessionId: session.sdkSessionId });
+        if (onComplete) onComplete({ sdkSessionId: session.sdkSessionId, ...(finalResult || {}) });
       } catch (err) {
         console.error(`[chat-bridge] Error in session ${sessionId}:`, err.message || err);
         session.active = false;
         this.sessions.delete(sessionId);
         if (err.name === 'AbortError') {
-          if (onComplete) onComplete({ sdkSessionId: session.sdkSessionId });
+          if (onComplete) onComplete({ sdkSessionId: session.sdkSessionId, ...(finalResult || {}) });
         } else {
           if (onError) onError(err);
         }

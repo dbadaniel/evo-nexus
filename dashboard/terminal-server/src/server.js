@@ -90,6 +90,118 @@ class TerminalServer {
     await this.sessionStore.saveSessions(this.claudeSessions);
   }
 
+  _usageNumber(value) {
+    const n = Number(value || 0);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  _extractUsage(info = {}) {
+    const usage = info.usage || {};
+    const inputTokens = this._usageNumber(usage.input_tokens);
+    const outputTokens = this._usageNumber(usage.output_tokens);
+    const cacheCreationTokens = this._usageNumber(usage.cache_creation_input_tokens || usage.cache_creation_tokens);
+    const cacheReadTokens = this._usageNumber(usage.cache_read_input_tokens || usage.cache_read_tokens);
+    const totalCost = this._usageNumber(info.totalCost ?? info.total_cost_usd);
+
+    if (!inputTokens && !outputTokens && !cacheCreationTokens && !cacheReadTokens && !totalCost) {
+      return null;
+    }
+
+    return {
+      inputTokens,
+      outputTokens,
+      cacheCreationTokens,
+      cacheReadTokens,
+      totalCost,
+    };
+  }
+
+  recordChatUsage(chatSession, sessionId, info = {}) {
+    const usage = this._extractUsage(info);
+    if (!usage) return;
+
+    const agent = chatSession.agentName || 'unknown';
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const runName = `chat:${agent}`;
+    const logsDir = path.join(this.baseFolder, 'ADWs', 'logs');
+    const metricsPath = path.join(logsDir, 'metrics.json');
+    fs.mkdirSync(logsDir, { recursive: true });
+
+    chatSession.sessionUsage = chatSession.sessionUsage || {
+      requests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheTokens: 0,
+      totalCost: 0,
+      models: {},
+    };
+    chatSession.sessionUsage.requests += 1;
+    chatSession.sessionUsage.inputTokens += usage.inputTokens;
+    chatSession.sessionUsage.outputTokens += usage.outputTokens;
+    chatSession.sessionUsage.cacheTokens += usage.cacheCreationTokens + usage.cacheReadTokens;
+    chatSession.sessionUsage.totalCost = Number((chatSession.sessionUsage.totalCost + usage.totalCost).toFixed(6));
+
+    let metrics = {};
+    try {
+      metrics = JSON.parse(fs.readFileSync(metricsPath, 'utf8'));
+    } catch {
+      metrics = {};
+    }
+
+    if (!metrics[runName]) {
+      metrics[runName] = {
+        runs: 0,
+        successes: 0,
+        failures: 0,
+        total_seconds: 0,
+        avg_seconds: 0,
+        last_run: null,
+        agent,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cache_creation_tokens: 0,
+        total_cache_read_tokens: 0,
+        total_cost_usd: 0,
+        avg_cost_usd: 0,
+      };
+    }
+
+    const metric = metrics[runName];
+    metric.runs += 1;
+    metric.successes += 1;
+    metric.success_rate = Number(((metric.successes / metric.runs) * 100).toFixed(1));
+    metric.last_run = nowIso;
+    metric.agent = agent;
+    metric.total_input_tokens = this._usageNumber(metric.total_input_tokens) + usage.inputTokens;
+    metric.total_output_tokens = this._usageNumber(metric.total_output_tokens) + usage.outputTokens;
+    metric.total_cache_creation_tokens = this._usageNumber(metric.total_cache_creation_tokens) + usage.cacheCreationTokens;
+    metric.total_cache_read_tokens = this._usageNumber(metric.total_cache_read_tokens) + usage.cacheReadTokens;
+    metric.total_cost_usd = Number((this._usageNumber(metric.total_cost_usd) + usage.totalCost).toFixed(5));
+    metric.avg_cost_usd = Number((metric.total_cost_usd / metric.runs).toFixed(5));
+    metric.last_input_tokens = usage.inputTokens;
+    metric.last_output_tokens = usage.outputTokens;
+    metric.last_cost_usd = Number(usage.totalCost.toFixed(5));
+
+    fs.writeFileSync(metricsPath, JSON.stringify(metrics, null, 2));
+
+    const day = nowIso.slice(0, 10);
+    const dailyLogPath = path.join(logsDir, `${day}.jsonl`);
+    const entry = {
+      timestamp: nowIso,
+      run: runName,
+      source: 'chat',
+      agent,
+      session_id: sessionId,
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      cache_creation_tokens: usage.cacheCreationTokens,
+      cache_read_tokens: usage.cacheReadTokens,
+      cost_usd: Number(usage.totalCost.toFixed(5)),
+    };
+    fs.appendFileSync(dailyLogPath, `${JSON.stringify(entry)}\n`);
+  }
+
   _checkPathAccess(targetPath, requireWrite = false) {
     try {
       const mode = requireWrite ? fs.constants.R_OK | fs.constants.W_OK : fs.constants.R_OK;
@@ -809,6 +921,7 @@ class TerminalServer {
                   if (info?.sdkSessionId) {
                     chatSession.sdkSessionId = info.sdkSessionId;
                   }
+                  this.recordChatUsage(chatSession, wsInfo.claudeSessionId, info);
                   // Save assistant message to history
                   if (assistantBlocks.length > 0) {
                     const assistantMsg = {

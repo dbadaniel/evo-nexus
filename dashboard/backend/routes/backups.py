@@ -97,7 +97,7 @@ def create_backup():
     if denied:
         return denied
 
-    if _running_jobs.get("backup"):
+    if _running_jobs.get("backup", {}).get("status") == "running":
         return jsonify({"error": "A backup is already running"}), 409
 
     target = request.get_json(silent=True) or {}
@@ -113,7 +113,7 @@ def create_backup():
             if s3_upload and zip_path and zip_path.exists():
                 zip_path.unlink(missing_ok=True)
             _running_jobs["backup"] = {"status": "done"}
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             _running_jobs["backup"] = {"status": "error", "error": str(e)}
 
     _running_jobs["backup"] = {"status": "running"}
@@ -162,7 +162,7 @@ def restore_backup(filename):
             _post_restore_migrate()
 
             _running_jobs["restore"] = {"status": "done", "mode": mode}
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             _running_jobs["restore"] = {"status": "error", "error": str(e)}
 
     _running_jobs["restore"] = {"status": "running"}

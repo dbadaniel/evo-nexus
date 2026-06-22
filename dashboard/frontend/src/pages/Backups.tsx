@@ -869,6 +869,20 @@ export default function Backups() {
   const cancelRequested = !!config?.brain_repo?.cancel_requested
   const [optimisticSync, setOptimisticSync] = useState(false)
   const brainBusy = syncInProgress || optimisticSync
+
+  // While the user is watching an active Brain Repo job, refresh quickly so
+  // completion and last_error replace the spinner without a page reload.
+  useEffect(() => {
+    if (!brainBusy) return
+    const tick = () => {
+      if (document.visibilityState !== 'visible') return
+      api.get('/backups/config').then((c) => setConfig(c)).catch(() => {})
+    }
+    tick()
+    const interval = setInterval(tick, 2000)
+    return () => clearInterval(interval)
+  }, [brainBusy])
+
   const handleBrainRepoMilestone = async () => {
     setOptimisticSync(true)
     try {

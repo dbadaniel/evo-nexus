@@ -55,6 +55,7 @@ _job_lock = threading.Lock()
 JOB_KIND_SYNC = "sync"
 JOB_KIND_MILESTONE = "milestone"
 JOB_KIND_BOOTSTRAP = "bootstrap"
+JOB_KIND_CLONE = "clone"
 JOB_KIND_WATCHER = "watcher"
 
 # Max time a job may hold sync_in_progress before the janitor reclaims it.
@@ -69,6 +70,11 @@ class JobCancelled(Exception):
     Callers (run_sync_pipeline) catch this and treat it as a clean stop —
     last_error gets "cancelled by user" instead of a traceback.
     """
+
+
+def _brain_repos_dir() -> Path:
+    workspace = Path(__file__).resolve().parent.parent.parent.parent
+    return workspace / "dashboard" / "data" / "brain-repos"
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -382,6 +388,14 @@ def run_sync_pipeline(
             from brain_repo import git_ops  # type: ignore[import]
 
             _check_cancel(flask_app, user_id)
+            author_name = snap["repo_owner"] or "EvoNexus"
+            author_email = (
+                f"{snap['repo_owner']}@users.noreply.github.com"
+                if snap["repo_owner"] else "evonexus@users.noreply.github.com"
+            )
+            git_ops.ensure_identity(repo_dir, author_name, author_email)
+
+            _check_cancel(flask_app, user_id)
             copied, dropped = _mirror_workspace(flask_app, user_id, workspace, repo_dir)
             log.info(
                 "job_runner %s: mirrored %d files, removed %d with secrets",
@@ -443,8 +457,7 @@ def run_bootstrap_pipeline(
         error: str | None = None
         local_path_str: str | None = None
         try:
-            workspace = Path(__file__).resolve().parent.parent.parent.parent
-            base_dir = workspace / "dashboard" / "data" / "brain-repos"
+            base_dir = _brain_repos_dir()
             base_dir.mkdir(parents=True, exist_ok=True)
             local_path = base_dir / repo_name
 
@@ -527,6 +540,61 @@ def run_bootstrap_pipeline(
             )
 
 
+def run_clone_pipeline(
+    flask_app,
+    user_id: int,
+    *,
+    token: str,
+    repo_url: str,
+    repo_name: str,
+    sync_after_clone: dict | None = None,
+) -> None:
+    """Clone an existing brain repo and optionally enqueue the requested sync."""
+    from models import BrainRepoConfig, db  # type: ignore[import]
+
+    clone_succeeded = False
+    with _job_lock:
+        error: str | None = None
+        local_path = _brain_repos_dir() / repo_name
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            if local_path.exists():
+                shutil.rmtree(local_path, ignore_errors=True)
+
+            _check_cancel(flask_app, user_id)
+            from brain_repo import git_ops  # type: ignore[import]
+            git_ops.clone(repo_url, token, local_path)
+            _check_cancel(flask_app, user_id)
+
+            with flask_app.app_context():
+                config = BrainRepoConfig.query.filter_by(user_id=user_id).first()
+                if config is not None:
+                    config.local_path = str(local_path)
+                    db.session.commit()
+            clone_succeeded = True
+        except JobCancelled:
+            error = "cancelled by user"
+        except Exception as exc:
+            error = f"clone failed: {exc}"
+            log.exception("clone pipeline raised")
+            if local_path.exists():
+                shutil.rmtree(local_path, ignore_errors=True)
+        finally:
+            _release_db_lock(
+                flask_app, user_id,
+                success=error is None,
+                error=error,
+            )
+
+    if clone_succeeded and sync_after_clone is not None:
+        enqueued = enqueue_sync(flask_app, user_id, **sync_after_clone)
+        if not enqueued:
+            log.warning(
+                "clone completed but follow-up sync could not be enqueued (user_id=%s)",
+                user_id,
+            )
+
+
 # ────────────────────────────────────────────────────────────────────────
 # Public enqueue API — what route handlers call.
 # ────────────────────────────────────────────────────────────────────────
@@ -580,6 +648,35 @@ def enqueue_bootstrap(
             "github_username": github_username,
         },
         name=f"brain-repo-bootstrap-{user_id}",
+        daemon=True,
+    )
+    t.start()
+    return True
+
+
+def enqueue_clone(
+    flask_app,
+    user_id: int,
+    *,
+    token: str,
+    repo_url: str,
+    repo_name: str,
+    sync_after_clone: dict | None = None,
+) -> bool:
+    """Spawn a daemon thread running run_clone_pipeline. Returns False if busy."""
+    if not _acquire_db_lock(flask_app, user_id, JOB_KIND_CLONE):
+        return False
+
+    t = threading.Thread(
+        target=run_clone_pipeline,
+        args=(flask_app, user_id),
+        kwargs={
+            "token": token,
+            "repo_url": repo_url,
+            "repo_name": repo_name,
+            "sync_after_clone": sync_after_clone,
+        },
+        name=f"brain-repo-clone-{user_id}",
         daemon=True,
     )
     t.start()

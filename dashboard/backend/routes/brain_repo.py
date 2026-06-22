@@ -349,6 +349,7 @@ def connect():
     # slow part and Cloudflare's 100 s request limit was killing first-time connects.
     bootstrap_pending = False
     bootstrap_params: dict | None = None
+    clone_params: dict | None = None
     if create_repo:
         try:
             from brain_repo.github_api import create_private_repo, get_github_username
@@ -401,6 +402,13 @@ def connect():
             abort(400, description="Repository must be private")
         repo_owner = repo_info.get("owner", {}).get("login", "")
         repo_name = repo_info.get("name", "")
+        if not repo_name:
+            abort(400, description="Could not determine repository name")
+        clone_params = {
+            "token": token,
+            "repo_url": repo_url,
+            "repo_name": repo_name,
+        }
 
     # Encrypt and store token.
     #
@@ -451,9 +459,9 @@ def connect():
     config.repo_url = repo_url
     config.repo_owner = repo_owner
     config.repo_name = repo_name
-    # local_path stays NULL when bootstrap is deferred — it gets filled in by
-    # job_runner.run_bootstrap_pipeline after the push succeeds. UI reads
-    # sync_in_progress + local_path==null as "initializing".
+    # The background bootstrap/clone fills this only after a usable checkout
+    # exists. Clearing it also avoids retaining a previous repo's local path.
+    config.local_path = None
     config.sync_enabled = True
     config.last_error = None
     db.session.commit()
@@ -471,6 +479,17 @@ def connect():
             )
         except ImportError:
             log.error("connect: job_runner unavailable — bootstrap will not run")
+    elif clone_params is not None:
+        try:
+            from brain_repo import job_runner
+            from flask import current_app
+            job_runner.enqueue_clone(
+                current_app._get_current_object(),  # type: ignore[attr-defined]
+                current_user.id,
+                **clone_params,
+            )
+        except ImportError:
+            log.error("connect: job_runner unavailable — clone will not run")
 
     return jsonify(config.to_dict())
 
@@ -631,14 +650,6 @@ def sync_force():
     if not config or not config.github_token_encrypted:
         abort(400, description="Brain repo not connected")
 
-    local_path = config.local_path
-    if not local_path:
-        abort(400, description="local_path not configured — repo not yet cloned")
-
-    repo_dir = Path(local_path)
-    if not repo_dir.is_dir() or not (repo_dir / ".git").is_dir():
-        abort(500, description=f"Local brain repo at {local_path} is missing or corrupt — re-connect")
-
     # Quick token-decryption probe so bad keys fail fast (before enqueueing).
     # The pipeline re-decrypts inside the thread — we just surface the error
     # synchronously here so the UI can react inline.
@@ -657,6 +668,37 @@ def sync_force():
     tag_name = f"milestone/manual-{now.strftime('%Y-%m-%d-%H-%M-%S')}"
 
     from flask import current_app
+    local_path = config.local_path
+    repo_dir = Path(local_path) if local_path else None
+    if repo_dir is None or not repo_dir.is_dir() or not (repo_dir / ".git").is_dir():
+        if not config.repo_url or not config.repo_name:
+            abort(400, description="Repository info incomplete — reconnect the brain repo")
+        enqueued = job_runner.enqueue_clone(
+            current_app._get_current_object(),  # type: ignore[attr-defined]
+            current_user.id,
+            token=token,
+            repo_url=config.repo_url,
+            repo_name=config.repo_name,
+            sync_after_clone={
+                "workspace": workspace,
+                "kind": job_runner.JOB_KIND_SYNC,
+                "tag_name": tag_name,
+                "commit_message": f"manual sync {now.isoformat()}",
+            },
+        )
+        if not enqueued:
+            return jsonify({
+                "ok": False,
+                "error": "Another sync is already running for this user.",
+                "code": "SYNC_IN_PROGRESS",
+            }), 409
+        return jsonify({
+            "ok": True,
+            "status": "queued",
+            "repairing_clone": True,
+            "tag": tag_name,
+        }), 202
+
     enqueued = job_runner.enqueue_sync(
         current_app._get_current_object(),  # type: ignore[attr-defined]
         current_user.id,

@@ -49,6 +49,32 @@ def clone(url: str, token: str, target: Path) -> None:
             f"git clone failed (exit {result.returncode}): {result.stderr[:500]}"
         )
 
+    # git clone records the authenticated URL as origin. Replace it immediately
+    # so a long-lived checkout never stores the PAT in .git/config.
+    sanitize_result = _run(
+        ["git", "remote", "set-url", "origin", url],
+        cwd=target,
+    )
+    if sanitize_result.returncode != 0:
+        raise RuntimeError(
+            "git clone succeeded but sanitizing origin failed "
+            f"(exit {sanitize_result.returncode}): {sanitize_result.stderr[:500]}"
+        )
+
+
+def ensure_identity(repo_dir: Path, name: str, email: str) -> None:
+    """Set repository-local author identity when the clone has none."""
+    for key, value in (("user.name", name), ("user.email", email)):
+        current = _run(["git", "config", "--get", key], cwd=repo_dir)
+        if current.returncode == 0 and current.stdout.strip():
+            continue
+        result = _run(["git", "config", key, value], cwd=repo_dir)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git config {key} failed (exit {result.returncode}): "
+                f"{result.stderr[:500]}"
+            )
+
 
 def commit_all(repo_dir: Path, message: str) -> bool:
     """Stage all changes and commit.

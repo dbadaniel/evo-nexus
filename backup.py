@@ -181,10 +181,29 @@ def collect_files() -> list[str]:
     # `plugins/` is listed explicitly so installed plugin artifacts land
     # in the backup even if an author's file pattern doesn't match
     # .gitignore (Strategy 2 would miss it in that case).
-    for root in ("workspace", "memory", "plugins"):
+    dynamic_roots = ["workspace", "memory", "plugins"]
+    has_git_checkout = (WORKSPACE / ".git").exists()
+    if not has_git_checkout:
+        # Dashboard images intentionally exclude .git. Walk each persistent
+        # user-data mount that git would normally discover for us.
+        dynamic_roots.extend([
+            "config",
+            "dashboard/data",
+            "ADWs/logs",
+            "ADWs/routines/custom",
+            ".claude/agent-memory",
+        ])
+
+    for root in dynamic_roots:
         for rel in _walk_dynamic(root):
             if not _should_exclude(rel):
                 files.add(rel)
+
+    if not has_git_checkout:
+        for filename in (".env", "CLAUDE.md", "mempalace.yaml", "entities.json"):
+            if (WORKSPACE / filename).is_file():
+                files.add(filename)
+        return sorted(files)
 
     # Strategy 2 — git-reported ignored files (covers everything else).
     try:
@@ -193,14 +212,11 @@ def collect_files() -> list[str]:
             capture_output=True, text=True, cwd=WORKSPACE, timeout=30
         )
         if result.returncode != 0:
-            print(f"{RED}Error running git ls-files: {result.stderr.strip()}{RESET}")
-            sys.exit(1)
+            raise RuntimeError(f"git ls-files failed: {result.stderr.strip()}")
     except FileNotFoundError:
-        print(f"{RED}git not found. Backup requires git.{RESET}")
-        sys.exit(1)
+        raise RuntimeError("git not found")
     except subprocess.TimeoutExpired:
-        print(f"{RED}git ls-files timed out. Repo may have too many ignored files.{RESET}")
-        sys.exit(1)
+        raise RuntimeError("git ls-files timed out")
 
     for line in result.stdout.strip().splitlines():
         line = line.strip()

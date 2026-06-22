@@ -40,6 +40,7 @@ RUN uv venv .venv && uv sync --no-dev
 COPY dashboard/backend/ dashboard/backend/
 COPY social-auth/ social-auth/
 COPY scheduler.py ./
+COPY backup.py ./
 
 # Copy workspace assets the backend reads at runtime.
 # Without these, /api/agents, /api/skills, /api/commands etc. all return empty
