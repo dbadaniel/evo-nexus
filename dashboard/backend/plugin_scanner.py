@@ -21,7 +21,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCANNER_VERSION = "1.0.0"
+SCANNER_VERSION = "1.0.1"
 
 # ---------------------------------------------------------------------------
 # Severity constants
@@ -282,7 +282,7 @@ _PATTERN_DEFS: list[PatternDef] = [
         pattern=_r(
             r"""(?x)
             (?:
-                [A-Za-z0-9+/]{40,}={0,2}   # raw base64 ≥40 chars
+                [A-Za-z0-9+/]{80,}={0,2}   # raw base64; avoid prose/URL-list false positives
               | (?:atob|btoa)\s*\(          # JS atob/btoa
               | Buffer\.from\s*\([^,]+,\s*['"]base64['"]  # Node Buffer.from base64
               | base64\.(?:b64decode|b64encode)\s*\(  # Python base64
