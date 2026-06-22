@@ -1167,6 +1167,11 @@ def install_plugin():
         }
         finalize_install(slug, final_manifest)
 
+        # Persist activation separately from the dashboard DB so runtime
+        # containers can safely rebuild plugin resources after an image update.
+        from plugin_file_ops import write_runtime_state
+        write_runtime_state(plugin_dir, enabled=True, capabilities_disabled={})
+
         _audit(conn, slug, "install", {"source_url": source_url}, success=True)
         invalidate_agent_meta_cache()
         lock.__exit__(None, None, None)
@@ -1703,6 +1708,13 @@ def update_plugin_status(slug: str):
         conn.commit()
         _audit(conn, slug, "enable" if enabled else "disable")
 
+        from plugin_file_ops import write_runtime_state
+        write_runtime_state(
+            PLUGINS_DIR / slug,
+            enabled=bool(enabled),
+            capabilities_disabled=caps_disabled,
+        )
+
         # Rebuild rules index after status update so enabled/disabled filter is correct
         try:
             disabled_rules = caps_disabled.get("rules", [])
@@ -1802,6 +1814,13 @@ def update_plugin_capability(slug: str):
             (new_caps_json, slug),
         )
         conn.execute("COMMIT")
+
+        from plugin_file_ops import write_runtime_state
+        write_runtime_state(
+            PLUGINS_DIR / slug,
+            enabled=bool(row["plugin_enabled"]),
+            capabilities_disabled=caps_disabled,
+        )
 
         # --- Side effects per capability type ---
         if cap_type in ("skills", "agents", "commands"):

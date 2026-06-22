@@ -38,6 +38,34 @@ RULES_INDEX_PATH = WORKSPACE / ".claude" / "rules" / "_plugins-index.md"
 
 # Manifest filename inside each installed plugin dir
 MANIFEST_FILENAME = ".install-manifest.json"
+RUNTIME_STATE_FILENAME = ".runtime-state.json"
+
+
+def write_runtime_state(
+    plugin_dir: Path,
+    *,
+    enabled: bool,
+    capabilities_disabled: Dict[str, Any] | None = None,
+) -> Path:
+    """Persist the runtime activation state alongside the plugin source."""
+    path = plugin_dir / RUNTIME_STATE_FILENAME
+    payload = {
+        "enabled": bool(enabled),
+        "capabilities_disabled": capabilities_disabled or {},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".runtime-state-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +189,7 @@ def copy_with_manifest(
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_root = str(dest_dir.resolve()) + "/"
+    dest_root = dest_dir.resolve()
 
     added: List[Dict[str, Any]] = []
 
@@ -174,8 +202,8 @@ def copy_with_manifest(
                 continue
             dest_name = _enforce_namespace(src_entry.name, slug, category)
             dest_skill_dir = dest_dir / dest_name
-            real_dest = str(dest_skill_dir.resolve())
-            if not real_dest.startswith(dest_root):
+            real_dest = dest_skill_dir.resolve()
+            if not real_dest.is_relative_to(dest_root):
                 raise ValueError(
                     f"Path traversal detected: '{dest_name}' resolves outside dest_dir."
                 )
@@ -210,8 +238,8 @@ def copy_with_manifest(
         dest_name = _enforce_namespace(src_file.name, slug, category)
         dest_file = dest_dir / dest_name
 
-        real_dest = str(dest_file.resolve())
-        if not real_dest.startswith(dest_root):
+        real_dest = dest_file.resolve()
+        if not real_dest.is_relative_to(dest_root):
             raise ValueError(
                 f"Path traversal detected: '{dest_name}' resolves outside dest_dir."
             )

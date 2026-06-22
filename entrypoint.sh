@@ -25,6 +25,7 @@ DEFAULTS_DIR=/workspace/_defaults
 # --- 1. Ensure writable dirs exist (volumes may mount empty) ---------------
 mkdir -p "$CONFIG_DIR" \
          /workspace/workspace \
+         /workspace/plugins \
          /workspace/memory \
          /workspace/ADWs/logs \
          /workspace/.claude/agent-memory \
@@ -111,6 +112,19 @@ set -a
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/.env" 2>/dev/null || true
 set +a
+
+# --- 5b. Rehydrate plugin resources from the persistent plugin volume -----
+# Native agents/skills remain image-owned and are refreshed on every Nexus
+# update. Only namespaced plugin-* resources are rebuilt into this container's
+# ephemeral /workspace/.claude tree.
+_PLUGIN_SYNC=/workspace/dashboard/backend/plugin_runtime_sync.py
+_PYBIN=/workspace/.venv/bin/python3
+if [ -f "$_PLUGIN_SYNC" ] && [ -x "$_PYBIN" ]; then
+    if ! "$_PYBIN" "$_PLUGIN_SYNC"; then
+        echo "[$(date -Is)] WARNING: plugin resource sync failed; continuing startup" >&2
+    fi
+fi
+unset _PLUGIN_SYNC _PYBIN
 
 # --- 6. Optional: _FILE env vars (explicit Docker Secrets pattern) ---------
 for file_var in $(compgen -A variable | grep -E '_FILE$' || true); do
