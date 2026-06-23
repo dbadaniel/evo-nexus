@@ -17,11 +17,13 @@
  * definition.
  */
 const isViteDev = import.meta.env.DEV
+const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+const useDirectLocalTerminal = isViteDev || (isLocalHost && window.location.protocol === 'http:')
 
-export const TS_HTTP = isViteDev
+export const TS_HTTP = useDirectLocalTerminal
   ? `http://${window.location.hostname}:32352`
   : `${window.location.protocol}//${window.location.host}/terminal`
 
-export const TS_WS = isViteDev
+export const TS_WS = useDirectLocalTerminal
   ? `ws://${window.location.hostname}:32352`
   : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/terminal`

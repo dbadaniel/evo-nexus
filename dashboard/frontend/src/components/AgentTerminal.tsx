@@ -36,6 +36,8 @@ const terminalOverride = rawOverride ? rawOverride.replace(/\/+$/, '') : null
 
 const hostname = window.location.hostname
 const isViteDev = import.meta.env.DEV
+const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1'
+const useDirectLocalTerminal = isViteDev || (isLocalHost && window.location.protocol === 'http:')
 
 // Resolve an override URL into the (httpBase, wsBase) pair the rest of the
 // component expects. Accepts either http(s):// or ws(s):// — both schemes
@@ -61,13 +63,13 @@ const override = terminalOverride ? resolveOverride(terminalOverride) : null
 
 const CC_WEB_HTTP = override
   ? override.http
-  : isViteDev
+  : useDirectLocalTerminal
     ? `http://${hostname}:32352`
     : `${window.location.origin}/terminal`
 
 const CC_WEB_WS = override
   ? override.ws
-  : isViteDev
+  : useDirectLocalTerminal
     ? `ws://${hostname}:32352`
     : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/terminal`
 

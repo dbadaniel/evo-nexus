@@ -26,7 +26,9 @@ type Tab = 'sessions' | 'profile' | 'memory'
 // `connect-src 'self'` CSP directive even when the network path works.
 // In Vite dev mode (no proxy mounted) we fall back to a direct connection.
 const isViteDev = import.meta.env.DEV
-const TS_HTTP = isViteDev
+const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+const useDirectLocalTerminal = isViteDev || (isLocalHost && window.location.protocol === 'http:')
+const TS_HTTP = useDirectLocalTerminal
   ? `http://${window.location.hostname}:32352`
   : `${window.location.origin}/terminal`
 
