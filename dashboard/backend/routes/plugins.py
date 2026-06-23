@@ -50,14 +50,14 @@ def _get_db() -> sqlite3.Connection:
     return conn
 
 
-def _audit(conn: sqlite3.Connection, plugin_id: str, action: str, payload: Any = None, success: bool = True) -> None:
+def _audit(conn: sqlite3.Connection, slug: str, action: str, payload: Any = None, success: bool = True) -> None:
     """Write a row to plugin_audit_log."""
     try:
         conn.execute(
-            "INSERT INTO plugin_audit_log (plugin_id, action, payload, success, created_at) "
+            "INSERT INTO plugin_audit_log (slug, event, detail_json, verdict, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (plugin_id, action, json.dumps(payload) if payload is not None else None,
-             1 if success else 0, _now_iso()),
+            (slug, action, json.dumps(payload) if payload is not None else '{}',
+             "APPROVE" if success else "BLOCK", _now_iso()),
         )
         conn.commit()
     except Exception as exc:
@@ -351,8 +351,8 @@ def get_plugin_audit(slug: str):
         # Table may not exist on fresh install; treat absence as empty list.
         try:
             rows = conn.execute(
-                "SELECT id, action, success, created_at, payload "
-                "FROM plugins_audit WHERE plugin_id = ? "
+                "SELECT id, event as action, verdict as success, created_at, detail_json as payload "
+                "FROM plugin_audit_log WHERE slug = ? "
                 "ORDER BY created_at DESC LIMIT 100",
                 (slug,),
             ).fetchall()

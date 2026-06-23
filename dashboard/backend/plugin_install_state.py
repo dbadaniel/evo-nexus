@@ -6,11 +6,18 @@ On crash/restart, _crash_recovery_on_boot() detects orphaned state and rolls bac
 
 B1 (Raven): rollback_from_state() reverses steps in reverse order using
 accumulated state — does NOT require .install-manifest.json to exist.
-B2 (Raven): per-slug fcntl lock prevents concurrent installs of the same plugin.
+B2 (Raven): per-slug file lock prevents concurrent installs of the same plugin.
 """
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 import json
 import logging
 import os
@@ -47,7 +54,7 @@ def _lock_path(slug: str) -> Path:
 
 
 class InstallLock:
-    """Context manager for per-slug install lock (fcntl LOCK_EX | LOCK_NB)."""
+    """Context manager for per-slug install lock."""
 
     def __init__(self, slug: str):
         self._slug = slug
@@ -58,8 +65,8 @@ class InstallLock:
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = os.open(str(self._lock_path), os.O_CREAT | os.O_WRONLY, 0o644)
         try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            _lock_fd_nonblocking(self._fd)
+        except (BlockingIOError, OSError):
             os.close(self._fd)
             self._fd = None
             raise RuntimeError(
@@ -71,11 +78,31 @@ class InstallLock:
     def __exit__(self, *_):
         if self._fd is not None:
             try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                _unlock_fd(self._fd)
                 os.close(self._fd)
             except OSError:
                 pass
             self._fd = None
+
+
+def _lock_fd_nonblocking(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    if msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return
+    raise OSError("No supported file locking implementation is available")
+
+
+def _unlock_fd(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 def save_state(slug: str, state: dict) -> None:

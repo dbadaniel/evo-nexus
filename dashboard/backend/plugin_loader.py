@@ -471,6 +471,15 @@ class PluginInstaller:
         s = source.strip()
 
         if not s.startswith("github:") and not s.startswith("https://"):
+            # Wave 2.5 fix: allow uploaded archives (already in .staging)
+            from pathlib import Path as _Path
+            try:
+                p = _Path(s).resolve()
+                if p.is_relative_to(STAGING_DIR.resolve()):
+                    return p, ""
+            except Exception:
+                pass
+
             # Delegate error reporting to resolve_source for a single
             # consistent rejection message.
             self.resolve_source(s, auth_token=auth_token)

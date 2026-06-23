@@ -3,9 +3,9 @@
 ADR decisions implemented:
   #1  Effective name: plugin-{slug}-{server.name}
   #2  Target path: projects[WORKSPACE_ABS].mcpServers
-  #3  Atomic write: flock → backup → mutate → tmp → re-parse → os.replace → verify → unlock
+  #3  Atomic write: lock → backup → mutate → tmp → re-parse → os.replace → verify → unlock
   #4  Ownership in DB (manifest_json["mcp_servers_installed"]), zero custom fields in ~/.claude.json
-  #5  Global flock on ~/.claude.json.evonexus.lock (blocks, does not fail)
+  #5  Global lock on ~/.claude.json.evonexus.lock (blocks, does not fail)
   #7  Uninstall idempotent: match effective_name + args_hash[:16]; drift → skip + audit log
   #8  Update: tudo-ou-nada delta via apply_mcp_delta()
 
@@ -16,7 +16,14 @@ Restore semantics (advisor refinement):
 """
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 import hashlib
 import json
 import logging
@@ -165,22 +172,22 @@ def _args_hash(server_dict: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 class _ClaudeJsonWriter:
-    """Context manager that holds the global flock and provides read/write to ~/.claude.json."""
+    """Context manager that holds the global lock and provides read/write to ~/.claude.json."""
 
     def __init__(self) -> None:
         self._lock_fd: int | None = None
         self._backup_path: Path | None = None
 
     def __enter__(self) -> "_ClaudeJsonWriter":
-        # Step 1: acquire global flock (LOCK_EX, blocking — concurrent installs queue)
+        # Step 1: acquire global lock (blocking; concurrent installs queue)
         self._lock_fd = os.open(str(_LOCK_FILE), os.O_CREAT | os.O_WRONLY, 0o644)
-        fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+        _lock_fd_blocking(self._lock_fd)
         return self
 
     def __exit__(self, *_) -> None:
         if self._lock_fd is not None:
             try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                _unlock_fd(self._lock_fd)
                 os.close(self._lock_fd)
             except OSError:
                 pass
@@ -265,6 +272,30 @@ class _ClaudeJsonWriter:
                 old.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _lock_fd_blocking(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    if msvcrt is not None:
+        while True:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                time.sleep(0.1)
+    raise OSError("No supported file locking implementation is available")
+
+
+def _unlock_fd(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +458,7 @@ def apply_mcp_delta(
     """Update MCP entries in ~/.claude.json as a tudo-ou-nada delta (ADR decision #8).
 
     Computes added/removed/modified sets by server ``name``, then applies all
-    changes inside a single flock window. On any failure the backup created at
+    changes inside a single lock window. On any failure the backup created at
     the start of the write is restored (JSONDecodeError path only — see module
     docstring for advisor refinement).
 
