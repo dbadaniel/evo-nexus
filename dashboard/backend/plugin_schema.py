@@ -27,6 +27,13 @@ _ALLOWED_ASSET_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 # Hex SHA256 pattern (64 chars)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# Agent UI category/icon/color metadata.
+_AGENT_CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_LUCIDE_ICON_RE = re.compile(r"^[A-Z][A-Za-z0-9]{0,63}$")
+_CSS_COLOR_RE = re.compile(
+    r"^(#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}|var\(--[a-zA-Z0-9_-]+\))$"
+)
+
 # Semver: MAJOR.MINOR.PATCH with optional pre-release/build metadata
 _SEMVER_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
@@ -425,6 +432,10 @@ class PluginAgentEntry(BaseModel):
     file: str
     avatar: Optional[str] = None
     avatar_sha256: Optional[str] = None
+    category: Optional[str] = None
+    category_label: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
 
     @field_validator("file")
     @classmethod
@@ -452,6 +463,43 @@ class PluginAgentEntry(BaseModel):
     def avatar_path_valid(cls, v: Optional[str]) -> Optional[str]:
         if v is not None:
             return _validate_asset_path(v)
+        return v
+
+    @field_validator("category")
+    @classmethod
+    def category_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not _AGENT_CATEGORY_RE.match(v):
+            raise ValueError(
+                "agents[].category must be 1-64 chars: lowercase letters, "
+                "digits, underscore or hyphen; it must start with a digit/letter."
+            )
+        return v
+
+    @field_validator("category_label")
+    @classmethod
+    def category_label_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v or len(v) > 80:
+                raise ValueError("agents[].category_label must be 1-80 characters.")
+        return v
+
+    @field_validator("icon")
+    @classmethod
+    def icon_name_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not _LUCIDE_ICON_RE.match(v):
+            raise ValueError(
+                "agents[].icon must be a Lucide icon component name, e.g. Compass."
+            )
+        return v
+
+    @field_validator("color")
+    @classmethod
+    def color_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not _CSS_COLOR_RE.match(v):
+            raise ValueError(
+                "agents[].color must be #RGB, #RRGGBB, or var(--token-name)."
+            )
         return v
 
     @field_validator("avatar_sha256")

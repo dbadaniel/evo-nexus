@@ -16,6 +16,7 @@ import {
   type PluginSidebarGroup,
   type PluginPage,
 } from '../lib/plugin-ui-registry'
+import { resolveLucideIcon } from '../lib/lucide-icon-map'
 
 interface VersionInfo {
   current: string
@@ -295,23 +296,26 @@ export default function Sidebar() {
                 <div className="flex flex-col gap-0.5">
                   {[...groupPages]
                     .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
-                    .map((page) => (
-                      <NavLink
-                        key={`${page.slug}-${page.id}`}
-                        to={`/plugins-ui/${page.slug}/${page.path}`}
-                        onClick={() => setMobileOpen(false)}
-                        className={({ isActive }) =>
-                          `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors border-l-2 ${
-                            isActive
-                              ? 'text-[#00FFA7] bg-[#00FFA7]/10 border-[#00FFA7]'
-                              : 'text-[#667085] hover:text-[#D0D5DD] hover:bg-white/5 border-transparent'
-                          }`
-                        }
-                      >
-                        <Puzzle size={16} />
-                        {page.label}
-                      </NavLink>
-                    ))}
+                    .map((page) => {
+                      const PageIcon = resolveLucideIcon(page.icon, Puzzle)
+                      return (
+                        <NavLink
+                          key={`${page.slug}-${page.id}`}
+                          to={`/plugins-ui/${page.slug}/${page.path}`}
+                          onClick={() => setMobileOpen(false)}
+                          className={({ isActive }) =>
+                            `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors border-l-2 ${
+                              isActive
+                                ? 'text-[#00FFA7] bg-[#00FFA7]/10 border-[#00FFA7]'
+                                : 'text-[#667085] hover:text-[#D0D5DD] hover:bg-white/5 border-transparent'
+                            }`
+                          }
+                        >
+                          <PageIcon size={16} />
+                          {page.label}
+                        </NavLink>
+                      )
+                    })}
                 </div>
               </div>
             </div>

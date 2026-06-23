@@ -27,12 +27,15 @@ import {
   Navigation,
   History,
   Lock,
+  Puzzle as PuzzleIcon,
   type LucideIcon,
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { AgentAvatar } from '../components/AgentAvatar'
+import { getAgentMeta as getRegisteredAgentMeta } from '../lib/agent-meta'
+import { resolveLucideIcon } from '../lib/lucide-icon-map'
 
-type Category = 'business' | 'engineering' | 'custom'
+type Category = string
 type EngTier = 'reasoning' | 'execution' | 'speed'
 
 const BUSINESS_AGENTS = new Set([
@@ -82,7 +85,9 @@ const ENGINEERING_TIERS: Record<EngTier, Set<string>> = {
 }
 
 function getCategory(agent: Agent): Category {
+  if (agent.category) return agent.category
   if (agent.custom || agent.name.startsWith('custom-')) return 'custom'
+  if (agent.name.startsWith('plugin-')) return 'plugins'
   if (BUSINESS_AGENTS.has(agent.name)) return 'business'
   return 'engineering'
 }
@@ -100,6 +105,10 @@ interface Agent {
   memory_count: number
   custom?: boolean
   color?: string
+  icon?: string
+  category?: string
+  category_label?: string
+  plugin_slug?: string
   model?: string
   locked?: boolean
 }
@@ -271,18 +280,35 @@ const DEFAULT_META: AgentMeta = {
 
 function getMeta(name: string, agent?: Agent): AgentMeta {
   const command = `/${name}`
+  const registered = getRegisteredAgentMeta(name)
   if (AGENT_META[name]) return { ...AGENT_META[name], command }
+  if (agent?.icon || agent?.color || agent?.category_label || registered.label !== 'Agent') {
+    const c = agent?.color || registered.color || DEFAULT_META.color
+    return {
+      ...DEFAULT_META,
+      icon: resolveLucideIcon(agent?.icon, registered.icon || DEFAULT_META.icon),
+      color: c,
+      colorMuted: colorWithAlpha(c, '1F', DEFAULT_META.colorMuted),
+      glowColor: colorWithAlpha(c, '26', DEFAULT_META.glowColor),
+      command,
+      label: agent?.category_label || registered.category_label || registered.label || DEFAULT_META.label,
+    }
+  }
   if (agent?.color) {
     const c = agent.color
     return {
       ...DEFAULT_META,
       color: c,
-      colorMuted: `${c}1F`,
-      glowColor: `${c}26`,
+      colorMuted: colorWithAlpha(c, '1F', DEFAULT_META.colorMuted),
+      glowColor: colorWithAlpha(c, '26', DEFAULT_META.glowColor),
       command,
     }
   }
   return { ...DEFAULT_META, command }
+}
+
+function colorWithAlpha(color: string, alpha: string, fallback: string): string {
+  return color.startsWith('#') ? `${color}${alpha}` : fallback
 }
 
 function formatAgentName(name: string): string {
@@ -543,29 +569,43 @@ function OracleHeroCard({ agent, isRunning }: { agent: Agent; isRunning: boolean
 
 type FilterValue = 'all' | Category
 
-const FILTERS: { value: FilterValue; label: string; icon: LucideIcon }[] = [
-  { value: 'all', label: 'All', icon: Bot },
-  { value: 'business', label: 'Business', icon: Building2 },
-  { value: 'engineering', label: 'Engineering', icon: Code2 },
-  { value: 'custom', label: 'Custom', icon: Sparkles },
-]
-
-const CATEGORY_META: Record<Category, { label: string; color: string; description: string }> = {
+const CORE_CATEGORY_META: Record<string, { label: string; color: string; description: string; icon: LucideIcon }> = {
   business: {
     label: 'Business',
     color: '#00FFA7',
     description: 'Operations, finance, marketing, HR, legal, product, data',
+    icon: Building2,
   },
   engineering: {
     label: 'Engineering',
     color: '#818CF8',
-    description: 'Software development — reasoning, execution, speed tiers',
+    description: 'Software development - reasoning, execution, speed tiers',
+    icon: Code2,
+  },
+  plugins: {
+    label: 'Plugins',
+    color: '#38BDF8',
+    description: 'Agents installed by plugins',
+    icon: PuzzleIcon,
   },
   custom: {
     label: 'Custom',
     color: '#C084FC',
     description: 'Personal agents (gitignored)',
+    icon: Sparkles,
   },
+}
+
+function getCategoryMeta(category: string, agents: Agent[]) {
+  if (CORE_CATEGORY_META[category]) return CORE_CATEGORY_META[category]
+  const sample = agents.find((a) => getCategory(a) === category)
+  const color = sample?.color || '#38BDF8'
+  return {
+    label: sample?.category_label || category,
+    color,
+    description: sample?.plugin_slug ? `Plugin: ${sample.plugin_slug}` : 'Plugin agents',
+    icon: resolveLucideIcon(sample?.icon, PuzzleIcon),
+  }
 }
 
 const TIER_LABELS: Record<EngTier, string> = {
@@ -672,10 +712,34 @@ export default function Agents() {
   const activeCount = agents.filter((a) => a.memory_count > 0).length
 
   const counts = useMemo(() => {
-    const c = { all: agents.length, business: 0, engineering: 0, custom: 0 }
-    for (const a of agents) c[getCategory(a)]++
+    const c: Record<string, number> = { all: agents.length }
+    for (const a of agents) {
+      const category = getCategory(a)
+      c[category] = (c[category] || 0) + 1
+    }
     return c
   }, [agents])
+
+  const categoryKeys = useMemo(() => {
+    const keys = Array.from(new Set(agents.map(getCategory)))
+    const preferred = ['business', 'engineering']
+    const tail = ['plugins', 'custom']
+    return [
+      ...preferred.filter((k) => keys.includes(k)),
+      ...keys.filter((k) => !preferred.includes(k) && !tail.includes(k)).sort(),
+      ...tail.filter((k) => keys.includes(k)),
+    ]
+  }, [agents])
+
+  const filters = useMemo(() => {
+    return [
+      { value: 'all' as FilterValue, label: 'All', icon: Bot },
+      ...categoryKeys.map((category) => {
+        const meta = getCategoryMeta(category, agents)
+        return { value: category as FilterValue, label: meta.label, icon: meta.icon }
+      }),
+    ]
+  }, [agents, categoryKeys])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -691,36 +755,35 @@ export default function Agents() {
 
   const grouped = useMemo(() => {
     let oracle: Agent | null = null
-    const business: Agent[] = []
+    const sections: Record<string, Agent[]> = {}
     const engineering: Record<EngTier, Agent[]> & { other: Agent[] } = {
       reasoning: [],
       execution: [],
       speed: [],
       other: [],
     }
-    const custom: Agent[] = []
     for (const a of filtered) {
       if (a.name === 'oracle') {
         oracle = a
         continue
       }
       const cat = getCategory(a)
-      if (cat === 'business') business.push(a)
-      else if (cat === 'custom') custom.push(a)
-      else {
+      if (cat === 'engineering') {
         const tier = getEngineeringTier(a.name)
         if (tier) engineering[tier].push(a)
         else engineering.other.push(a)
+      } else {
+        if (!sections[cat]) sections[cat] = []
+        sections[cat].push(a)
       }
     }
     const sorter = (x: Agent, y: Agent) => x.name.localeCompare(y.name)
-    business.sort(sorter)
-    custom.sort(sorter)
+    for (const items of Object.values(sections)) items.sort(sorter)
     engineering.reasoning.sort(sorter)
     engineering.execution.sort(sorter)
     engineering.speed.sort(sorter)
     engineering.other.sort(sorter)
-    return { oracle, business, engineering, custom }
+    return { oracle, sections, engineering }
   }, [filtered])
 
   const isRunning = (name: string) =>
@@ -760,20 +823,20 @@ export default function Agents() {
             <div className="flex items-center gap-2">
               <Building2 size={14} className="text-[#00FFA7]" />
               <span className="text-[#8b949e]">
-                <span className="font-medium text-[#e6edf3]">{counts.business}</span> business
+                <span className="font-medium text-[#e6edf3]">{counts.business || 0}</span> business
               </span>
             </div>
             <div className="flex items-center gap-2">
               <Code2 size={14} className="text-[#818CF8]" />
               <span className="text-[#8b949e]">
-                <span className="font-medium text-[#e6edf3]">{counts.engineering}</span> engineering
+                <span className="font-medium text-[#e6edf3]">{counts.engineering || 0}</span> engineering
               </span>
             </div>
-            {counts.custom > 0 && (
+            {(counts.custom || 0) > 0 && (
               <div className="flex items-center gap-2">
                 <Sparkles size={14} className="text-[#C084FC]" />
                 <span className="text-[#8b949e]">
-                  <span className="font-medium text-[#e6edf3]">{counts.custom}</span> custom
+                  <span className="font-medium text-[#e6edf3]">{counts.custom || 0}</span> custom
                 </span>
               </div>
             )}
@@ -828,7 +891,7 @@ export default function Agents() {
       {!loading && agents.length > 0 && (
         <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-wrap items-center gap-2">
-            {FILTERS.map((f) => {
+            {filters.map((f) => {
               const FIcon = f.icon
               const active = filter === f.value
               const c = counts[f.value]
@@ -893,78 +956,68 @@ export default function Agents() {
           {grouped.oracle && (
             <OracleHeroCard agent={grouped.oracle} isRunning={isRunning(grouped.oracle.name)} />
           )}
-          {grouped.business.length > 0 && (
-            <section>
-              <SectionHeader
-                label={CATEGORY_META.business.label}
-                count={grouped.business.length}
-                color={CATEGORY_META.business.color}
-                description={CATEGORY_META.business.description}
-              />
-              <div className={gridClass}>
-                {grouped.business.map((agent) => (
-                  <AgentCard key={agent.name} agent={agent} isRunning={isRunning(agent.name)} />
-                ))}
-              </div>
-            </section>
-          )}
+          {categoryKeys.map((category) => {
+            const meta = getCategoryMeta(category, agents)
 
-          {(grouped.engineering.reasoning.length > 0 ||
-            grouped.engineering.execution.length > 0 ||
-            grouped.engineering.speed.length > 0 ||
-            grouped.engineering.other.length > 0) && (
-            <section>
-              <SectionHeader
-                label={CATEGORY_META.engineering.label}
-                count={
-                  grouped.engineering.reasoning.length +
-                  grouped.engineering.execution.length +
-                  grouped.engineering.speed.length +
-                  grouped.engineering.other.length
-                }
-                color={CATEGORY_META.engineering.color}
-                description={CATEGORY_META.engineering.description}
-              />
-              {(['reasoning', 'execution', 'speed'] as EngTier[]).map((tier) =>
-                grouped.engineering[tier].length > 0 ? (
-                  <div key={tier}>
-                    <SubSectionHeader label={TIER_LABELS[tier]} count={grouped.engineering[tier].length} />
-                    <div className={gridClass}>
-                      {grouped.engineering[tier].map((agent) => (
-                        <AgentCard key={agent.name} agent={agent} isRunning={isRunning(agent.name)} />
-                      ))}
+            if (category === 'engineering') {
+              const total =
+                grouped.engineering.reasoning.length +
+                grouped.engineering.execution.length +
+                grouped.engineering.speed.length +
+                grouped.engineering.other.length
+              if (total === 0) return null
+              return (
+                <section key={category}>
+                  <SectionHeader
+                    label={meta.label}
+                    count={total}
+                    color={meta.color}
+                    description={meta.description}
+                  />
+                  {(['reasoning', 'execution', 'speed'] as EngTier[]).map((tier) =>
+                    grouped.engineering[tier].length > 0 ? (
+                      <div key={tier}>
+                        <SubSectionHeader label={TIER_LABELS[tier]} count={grouped.engineering[tier].length} />
+                        <div className={gridClass}>
+                          {grouped.engineering[tier].map((agent) => (
+                            <AgentCard key={agent.name} agent={agent} isRunning={isRunning(agent.name)} />
+                          ))}
+                        </div>
+                      </div>
+                    ) : null
+                  )}
+                  {grouped.engineering.other.length > 0 && (
+                    <div>
+                      <SubSectionHeader label="Other" count={grouped.engineering.other.length} />
+                      <div className={gridClass}>
+                        {grouped.engineering.other.map((agent) => (
+                          <AgentCard key={agent.name} agent={agent} isRunning={isRunning(agent.name)} />
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                ) : null
-              )}
-              {grouped.engineering.other.length > 0 && (
-                <div>
-                  <SubSectionHeader label="Other" count={grouped.engineering.other.length} />
-                  <div className={gridClass}>
-                    {grouped.engineering.other.map((agent) => (
-                      <AgentCard key={agent.name} agent={agent} isRunning={isRunning(agent.name)} />
-                    ))}
-                  </div>
-                </div>
-              )}
-            </section>
-          )}
+                  )}
+                </section>
+              )
+            }
 
-          {grouped.custom.length > 0 && (
-            <section>
-              <SectionHeader
-                label={CATEGORY_META.custom.label}
-                count={grouped.custom.length}
-                color={CATEGORY_META.custom.color}
-                description={CATEGORY_META.custom.description}
-              />
-              <div className={gridClass}>
-                {grouped.custom.map((agent) => (
-                  <AgentCard key={agent.name} agent={agent} isRunning={isRunning(agent.name)} />
-                ))}
-              </div>
-            </section>
-          )}
+            const items = grouped.sections[category] || []
+            if (items.length === 0) return null
+            return (
+              <section key={category}>
+                <SectionHeader
+                  label={meta.label}
+                  count={items.length}
+                  color={meta.color}
+                  description={meta.description}
+                />
+                <div className={gridClass}>
+                  {items.map((agent) => (
+                    <AgentCard key={agent.name} agent={agent} isRunning={isRunning(agent.name)} />
+                  ))}
+                </div>
+              </section>
+            )
+          })}
         </div>
       )}
     </div>

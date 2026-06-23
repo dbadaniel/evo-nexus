@@ -21,6 +21,7 @@ import {
   Zap,
   type LucideIcon,
 } from 'lucide-react'
+import { resolveLucideIcon } from './lucide-icon-map'
 
 export interface AgentMeta {
   icon: LucideIcon
@@ -30,6 +31,8 @@ export interface AgentMeta {
   avatar?: string
   // Wave 2.0: plugin agents may declare an avatar_url served by the backend
   avatar_url?: string | null
+  category?: string | null
+  category_label?: string | null
 }
 
 // ---------------------------------------------------------------------------
@@ -108,26 +111,39 @@ export async function hydrateAgentMeta(force = false): Promise<void> {
     const API = import.meta.env.DEV ? 'http://localhost:8080' : ''
     const res = await fetch(`${API}/api/agent-meta`, { credentials: 'include' })
     if (!res.ok) return  // silently keep seed on non-2xx
-    const data: Record<string, { label: string; avatar_url: string | null }> = await res.json()
+    const data: Record<string, {
+      label: string
+      avatar_url: string | null
+      icon?: string | null
+      color?: string | null
+      category?: string | null
+      category_label?: string | null
+    }> = await res.json()
     for (const [slug, entry] of Object.entries(data)) {
       const existing = _registry[slug]
       if (existing) {
         // Native agent: update avatar_url (and avatar for AgentAvatar.tsx compat) if backend provides one
         _registry[slug] = {
           ...existing,
+          color: entry.color ?? existing.color,
+          icon: resolveLucideIcon(entry.icon, existing.icon),
           avatar_url: entry.avatar_url ?? existing.avatar_url,
           avatar: entry.avatar_url ?? existing.avatar,
+          category: entry.category ?? existing.category,
+          category_label: entry.category_label ?? existing.category_label,
         }
       } else {
         // Plugin agent: synthesize a new entry with defaults for icon/color/command.
         // Set both avatar_url (Wave 2.0 field) and avatar (AgentAvatar.tsx reads this).
         _registry[slug] = {
-          icon: Bot,
-          color: '#00FFA7',
+          icon: resolveLucideIcon(entry.icon, Bot),
+          color: entry.color ?? '#00FFA7',
           command: `/${slug}`,
           label: entry.label || slug,
           avatar_url: entry.avatar_url,
           avatar: entry.avatar_url ?? undefined,
+          category: entry.category,
+          category_label: entry.category_label,
         }
       }
     }

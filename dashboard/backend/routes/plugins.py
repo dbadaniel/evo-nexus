@@ -3226,7 +3226,14 @@ def _build_agent_meta_response() -> dict:
                 else:
                     avatar_url = f"/plugins/{plugin_slug}/ui/{avatar_path}"
 
-            result[namespaced_slug] = {"label": label, "avatar_url": avatar_url}
+            result[namespaced_slug] = {
+                "label": label,
+                "avatar_url": avatar_url,
+                "category": agent_entry.get("category"),
+                "category_label": agent_entry.get("category_label") or manifest.get("name", plugin_slug),
+                "icon": agent_entry.get("icon"),
+                "color": agent_entry.get("color"),
+            }
 
     return result
 
