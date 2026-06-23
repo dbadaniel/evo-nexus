@@ -917,11 +917,11 @@ app.register_blueprint(docs_bp)
 app.register_blueprint(mempalace_bp)
 app.register_blueprint(tasks_bp)
 app.register_blueprint(triggers_bp)
-app.register_blueprint(terminal_proxy_bp)
 
 # Mount the terminal-server WebSocket proxy on the same Sock instance the
-# rest of the app uses. Done after the blueprint is registered so route
-# names are unique. Without this, browsers connecting from a host other
+# rest of the app uses. Register it before the generic /terminal/<path>
+# HTTP proxy so /terminal/ws is handled as a WebSocket upgrade. Without this,
+# browsers connecting from a host other
 # than the one running the Node terminal-server (LAN, Tailscale Funnel,
 # SSH tunnel without the dynamic port forwarded) cannot reach it directly
 # due to CORS preflight + private-network-access policies.
@@ -936,6 +936,7 @@ except Exception as _exc:
         "interactions will require direct access to the terminal-server port.",
         _exc,
     )
+app.register_blueprint(terminal_proxy_bp)
 app.register_blueprint(backups_bp)
 app.register_blueprint(providers_bp)
 app.register_blueprint(settings_bp)
