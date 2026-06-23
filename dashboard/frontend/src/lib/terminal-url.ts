@@ -17,8 +17,8 @@
  * definition.
  */
 const isViteDev = import.meta.env.DEV
-const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-const useDirectLocalTerminal = isViteDev || (isLocalHost && window.location.protocol === 'http:')
+const directLocalTerminal = import.meta.env.VITE_TERMINAL_DIRECT_LOCAL === '1'
+const useDirectLocalTerminal = isViteDev || directLocalTerminal
 
 export const TS_HTTP = useDirectLocalTerminal
   ? `http://${window.location.hostname}:32352`
