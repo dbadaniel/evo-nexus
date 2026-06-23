@@ -31,6 +31,7 @@ export interface AgentMeta {
   avatar?: string
   // Wave 2.0: plugin agents may declare an avatar_url served by the backend
   avatar_url?: string | null
+  display_name?: string | null
   category?: string | null
   category_label?: string | null
 }
@@ -116,6 +117,7 @@ export async function hydrateAgentMeta(force = false): Promise<void> {
       avatar_url: string | null
       icon?: string | null
       color?: string | null
+      display_name?: string | null
       category?: string | null
       category_label?: string | null
     }> = await res.json()
@@ -129,6 +131,7 @@ export async function hydrateAgentMeta(force = false): Promise<void> {
           icon: resolveLucideIcon(entry.icon, existing.icon),
           avatar_url: entry.avatar_url ?? existing.avatar_url,
           avatar: entry.avatar_url ?? existing.avatar,
+          display_name: entry.display_name ?? existing.display_name,
           category: entry.category ?? existing.category,
           category_label: entry.category_label ?? existing.category_label,
         }
@@ -142,6 +145,7 @@ export async function hydrateAgentMeta(force = false): Promise<void> {
           label: entry.label || slug,
           avatar_url: entry.avatar_url,
           avatar: entry.avatar_url ?? undefined,
+          display_name: entry.display_name ?? entry.label ?? slug,
           category: entry.category,
           category_label: entry.category_label,
         }

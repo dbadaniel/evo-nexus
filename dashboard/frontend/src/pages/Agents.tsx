@@ -104,6 +104,7 @@ interface Agent {
   description: string
   memory_count: number
   custom?: boolean
+  display_name?: string
   color?: string
   icon?: string
   category?: string
@@ -311,7 +312,8 @@ function colorWithAlpha(color: string, alpha: string, fallback: string): string 
   return color.startsWith('#') ? `${color}${alpha}` : fallback
 }
 
-function formatAgentName(name: string): string {
+function formatAgentName(name: string, agent?: Agent): string {
+  if (agent?.display_name) return agent.display_name
   return name
     .split('-')
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
@@ -346,7 +348,7 @@ function AgentCard({ agent, isRunning }: { agent: Agent; isRunning: boolean }) {
         {/* Name + domain label */}
         <div className="relative mb-1.5">
           <h3 className="text-[13px] font-semibold text-[#e6edf3]">
-            {formatAgentName(agent.name)}
+            {formatAgentName(agent.name, agent)}
           </h3>
           <div className="mt-1 flex items-center gap-2">
             <span className="inline-block text-[10px] font-medium uppercase tracking-wider" style={{ color: meta.color, opacity: 0.8 }}>
@@ -420,7 +422,7 @@ function AgentCard({ agent, isRunning }: { agent: Agent; isRunning: boolean }) {
       {/* Name + domain label */}
       <div className="relative mb-1.5">
         <h3 className="text-[13px] font-semibold text-[#e6edf3] transition-colors duration-200 group-hover:text-white">
-          {formatAgentName(agent.name)}
+          {formatAgentName(agent.name, agent)}
         </h3>
         <div className="mt-1 flex items-center gap-2">
           <span
@@ -429,7 +431,11 @@ function AgentCard({ agent, isRunning }: { agent: Agent; isRunning: boolean }) {
           >
             {meta.label}
           </span>
-          {agent.custom ? (
+          {agent.plugin_slug ? (
+            <span className="rounded-full bg-[#38BDF8]/10 px-1.5 py-0.5 text-[9px] font-medium text-[#38BDF8] border border-[#38BDF8]/20">
+              plugin
+            </span>
+          ) : agent.custom ? (
             <span className="rounded-full bg-[#6B7280]/10 px-1.5 py-0.5 text-[9px] font-medium text-[#6B7280] border border-[#6B7280]/20">
               custom
             </span>

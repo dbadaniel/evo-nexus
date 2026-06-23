@@ -51,6 +51,23 @@ function formatName(slug: string): string {
     .join(' ')
 }
 
+function extractDisplayName(markdown: string | null): string | null {
+  if (!markdown) return null
+  const frontmatter = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  if (frontmatter) {
+    const titleLine = frontmatter[1]
+      .split(/\r?\n/)
+      .find((line) => /^(title|name|label):\s*/i.test(line.trim()))
+    if (titleLine) {
+      const value = titleLine.replace(/^(title|name|label):\s*/i, '').trim()
+      return value.replace(/^["']|["']$/g, '') || null
+    }
+  }
+  const body = frontmatter ? markdown.slice(frontmatter[0].length) : markdown
+  const heading = body.match(/^\s*#\s+(.+)$/m)
+  return heading?.[1]?.trim() || null
+}
+
 export default function AgentDetail() {
   const { name } = useParams()
   const { hasAgentAccess } = useAuth()
@@ -389,6 +406,7 @@ export default function AgentDetail() {
 
   const profileBody = extractProfileBody(content)
   const profileLead = extractProfileLead(content)
+  const displayName = meta.display_name || extractDisplayName(content) || formatName(name)
 
   return (
     <div className="flex h-full w-full flex-col bg-[#0C111D]">
@@ -414,7 +432,7 @@ export default function AgentDetail() {
 
         <div className="flex flex-col gap-0.5 min-w-0">
           <h1 className="text-[16px] font-semibold text-[#e6edf3] tracking-tight truncate">
-            {formatName(name)}
+            {displayName}
           </h1>
           <code
             className="font-mono text-[11px] tracking-tight"
@@ -479,7 +497,7 @@ export default function AgentDetail() {
             >
               <div className="flex items-center justify-between px-4 h-10 border-b border-[#21262d]">
                 <span className="text-[10px] uppercase tracking-[0.12em] text-[#667085]">
-                  {formatName(name)}
+                  {displayName}
                 </span>
                 <button
                   onClick={() => setRailOpen(false)}

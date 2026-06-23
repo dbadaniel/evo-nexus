@@ -32,6 +32,24 @@ A capability must be declared in `capabilities:` before the corresponding block 
 
 ---
 
+## `agents` - Agent Files And Display Metadata
+
+Plugins may declare agent markdown files and optional display metadata. The agent command and internal slug remain namespaced by the host, but `label`/`display_name` controls the title shown in the Agents UI.
+
+```yaml
+agents:
+  - file: agents/estrategista-turbo.md
+    label: "Estrategista Turbo"      # optional display title
+    category: lpsg
+    category_label: "Turbo Lancamento pago"
+    icon: Compass
+    color: "#FF5C00"
+```
+
+If `label`/`display_name` is omitted, EvoNexus derives the visible title from the file name (`estrategista-turbo.md` -> `Estrategista Turbo`). The internal command remains `/plugin-<plugin-slug>-<agent-file-slug>`.
+
+---
+
 ## `ui_entry_points` - Dashboard Pages And Sidebar Groups
 
 Plugins may declare dashboard pages and sidebar groups. Sidebar groups are rendered only while the plugin is enabled and active.

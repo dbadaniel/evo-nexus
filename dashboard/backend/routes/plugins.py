@@ -3215,7 +3215,11 @@ def _build_agent_meta_response() -> dict:
             filename = Path(file_path).stem  # "pm-nova"
             namespaced_slug = f"plugin-{plugin_slug}-{filename}"
 
-            label = f"{manifest.get('name', plugin_slug)} / {filename}"
+            display_name = (
+                agent_entry.get("display_name")
+                or agent_entry.get("label")
+                or " ".join(part.capitalize() for part in filename.split("-") if part)
+            )
             avatar_url: str | None = None
             if avatar_path:
                 # avatar_path is relative to plugin dir (e.g. ui/assets/avatars/pm-nova.png)
@@ -3227,7 +3231,8 @@ def _build_agent_meta_response() -> dict:
                     avatar_url = f"/plugins/{plugin_slug}/ui/{avatar_path}"
 
             result[namespaced_slug] = {
-                "label": label,
+                "label": display_name,
+                "display_name": display_name,
                 "avatar_url": avatar_url,
                 "category": agent_entry.get("category"),
                 "category_label": agent_entry.get("category_label") or manifest.get("name", plugin_slug),

@@ -430,6 +430,8 @@ class PluginAgentEntry(BaseModel):
     """
 
     file: str
+    label: Optional[str] = None
+    display_name: Optional[str] = None
     avatar: Optional[str] = None
     avatar_sha256: Optional[str] = None
     category: Optional[str] = None
@@ -463,6 +465,15 @@ class PluginAgentEntry(BaseModel):
     def avatar_path_valid(cls, v: Optional[str]) -> Optional[str]:
         if v is not None:
             return _validate_asset_path(v)
+        return v
+
+    @field_validator("label", "display_name")
+    @classmethod
+    def display_name_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v or len(v) > 80:
+                raise ValueError("agents[].label/display_name must be 1-80 characters.")
         return v
 
     @field_validator("category")

@@ -23,6 +23,10 @@ def _count_memory(name: str) -> int:
     return sum(1 for f in mem_dir.iterdir() if f.is_file())
 
 
+def _format_agent_label(slug: str) -> str:
+    return " ".join(part.capitalize() for part in slug.split("-") if part)
+
+
 def _plugin_agent_metadata() -> dict[str, dict]:
     """Return UI metadata for agents declared by active plugins."""
     if not DB_PATH.exists():
@@ -50,9 +54,16 @@ def _plugin_agent_metadata() -> dict[str, dict]:
             file_path = agent_entry.get("file") or ""
             if not file_path:
                 continue
-            agent_name = f"plugin-{plugin_slug}-{Path(file_path).stem}"
+            agent_file_slug = Path(file_path).stem
+            agent_name = f"plugin-{plugin_slug}-{agent_file_slug}"
+            display_name = (
+                agent_entry.get("display_name")
+                or agent_entry.get("label")
+                or _format_agent_label(agent_file_slug)
+            )
             entry = {
                 "plugin_slug": plugin_slug,
+                "display_name": display_name,
                 "category": agent_entry.get("category") or f"plugin-{plugin_slug}",
                 "category_label": agent_entry.get("category_label") or plugin_name,
             }
