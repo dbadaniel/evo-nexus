@@ -32,6 +32,45 @@ A capability must be declared in `capabilities:` before the corresponding block 
 
 ---
 
+## `ui_entry_points` - Dashboard Pages And Sidebar Groups
+
+Plugins may declare dashboard pages and sidebar groups. Sidebar groups are rendered only while the plugin is enabled and active.
+
+```yaml
+ui_entry_points:
+  sidebar_groups:
+    - id: lpsg
+      label: "Plugins"
+      position: "after:operations"  # optional; defaults to "bottom"
+      order: 10
+      collapsible: true
+
+  pages:
+    - id: turbo-dashboard
+      label: "Turbo Lancamento"
+      path: dashboard
+      bundle: ui/pages/dashboard.js
+      custom_element_name: turbo-dashboard-page
+      sidebar_group: lpsg
+      icon: Rocket
+      order: 10
+```
+
+Supported `sidebar_groups[].position` values:
+
+| Value | Placement |
+|---|---|
+| `after:main` | After the native Main group |
+| `after:operations` | After the native Operations group |
+| `after:data` | After the native Data group |
+| `after:system` | After the native System group |
+| `after:admin` | After the native Admin group |
+| `bottom` | After native groups and positioned plugin groups |
+
+`order` sorts multiple plugin groups within the same `position` bucket. When `position` is omitted, the dashboard keeps the legacy behavior and renders the plugin group at `bottom`.
+
+---
+
 ## `public_pages` — Token-Gated Public Pages
 
 Requires `capabilities: [public_pages]`.

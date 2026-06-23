@@ -28,6 +28,7 @@ export interface PluginPage {
 export interface PluginSidebarGroup {
   id: string
   label: string
+  position?: string
   order?: number
   collapsible?: boolean
 }

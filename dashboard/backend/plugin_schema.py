@@ -588,7 +588,9 @@ class PluginSidebarGroup(BaseModel):
 
     id: Annotated[str, Field(min_length=1, max_length=100)]
     label: Annotated[str, Field(min_length=1, max_length=200)]
-    # Rendering order among all sidebar groups; native groups occupy 1-5
+    # Sidebar insertion point: after:<native-group-key> or bottom.
+    position: str = "bottom"
+    # Rendering order among plugin groups in the same position bucket.
     order: int = 999
     collapsible: bool = True
 
@@ -597,6 +599,24 @@ class PluginSidebarGroup(BaseModel):
     def id_pattern(cls, v: str) -> str:
         if not re.match(r"^[a-z0-9-]+$", v):
             raise ValueError(f"PluginSidebarGroup id '{v}' must match ^[a-z0-9-]+$")
+        return v
+
+    @field_validator("position")
+    @classmethod
+    def position_valid(cls, v: str) -> str:
+        allowed = {
+            "after:main",
+            "after:operations",
+            "after:data",
+            "after:system",
+            "after:admin",
+            "bottom",
+        }
+        if v not in allowed:
+            raise ValueError(
+                "PluginSidebarGroup position must be one of: "
+                f"{', '.join(sorted(allowed))}"
+            )
         return v
 
 

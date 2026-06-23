@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { Fragment, useState, useEffect, useCallback } from 'react'
 import { NavLink } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useAuth } from '../context/AuthContext'
@@ -125,6 +125,8 @@ const roleBadgeClass: Record<string, string> = {
   viewer: 'bg-gray-500/20 text-gray-400',
 }
 
+const DEFAULT_PLUGIN_POSITION = 'bottom'
+
 export default function Sidebar() {
   const { user, logout, hasPermission } = useAuth()
   const { t } = useTranslation()
@@ -241,6 +243,77 @@ export default function Sidebar() {
     )
   }
 
+  const renderPluginGroup = (group: PluginSidebarGroup & { slug: string }) => {
+    const groupPages = pluginPages.filter(
+      (p) => p.slug === group.slug && p.sidebar_group === group.id
+    )
+    if (groupPages.length === 0) return null
+    const isCollapsed = collapsed[`plugin-${group.slug}-${group.id}`] ?? false
+    const storageKey = `plugin-${group.slug}-${group.id}`
+    return (
+      <div key={storageKey} className="mb-1">
+        {group.collapsible !== false ? (
+          <button
+            onClick={() => toggleGroup(storageKey)}
+            className="w-full flex items-center justify-between px-3 py-1.5 mt-2 group cursor-pointer"
+          >
+            <span className="text-[10px] uppercase tracking-wider text-[#667085] font-semibold select-none">
+              {group.label}
+            </span>
+            <ChevronDown
+              size={12}
+              className={`text-[#667085] transition-transform duration-200 group-hover:text-[#D0D5DD] ${
+                isCollapsed ? '-rotate-90' : ''
+              }`}
+            />
+          </button>
+        ) : (
+          <div className="px-3 py-1.5">
+            <span className="text-[10px] uppercase tracking-wider text-[#667085] font-semibold">
+              {group.label}
+            </span>
+          </div>
+        )}
+        <div
+          className={`overflow-hidden transition-all duration-200 ease-in-out ${
+            group.collapsible !== false && isCollapsed ? 'max-h-0 opacity-0' : 'max-h-96 opacity-100'
+          }`}
+        >
+          <div className="flex flex-col gap-0.5">
+            {[...groupPages]
+              .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
+              .map((page) => {
+                const PageIcon = resolveLucideIcon(page.icon, Puzzle)
+                return (
+                  <NavLink
+                    key={`${page.slug}-${page.id}`}
+                    to={`/plugins-ui/${page.slug}/${page.path}`}
+                    onClick={() => setMobileOpen(false)}
+                    className={({ isActive }) =>
+                      `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors border-l-2 ${
+                        isActive
+                          ? 'text-[#00FFA7] bg-[#00FFA7]/10 border-[#00FFA7]'
+                          : 'text-[#667085] hover:text-[#D0D5DD] hover:bg-white/5 border-transparent'
+                      }`
+                    }
+                  >
+                    <PageIcon size={16} />
+                    {page.label}
+                  </NavLink>
+                )
+              })}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const renderPluginGroupsForPosition = (position: string) =>
+    pluginGroups
+      .filter((group) => (group.position || DEFAULT_PLUGIN_POSITION) === position)
+      .sort((a, b) => (a.order ?? 999) - (b.order ?? 999) || a.label.localeCompare(b.label))
+      .map(renderPluginGroup)
+
   const sidebarContent = (
     <>
       <div className="px-5 py-6 flex items-center justify-between">
@@ -254,73 +327,13 @@ export default function Sidebar() {
       </div>
 
       <nav className="flex-1 overflow-y-auto px-3 pb-4">
-        {navGroups.map(renderGroup)}
-
-        {/* Wave 2.1: Plugin sidebar groups injected after native groups */}
-        {pluginGroups.map((group) => {
-          const groupPages = pluginPages.filter(
-            (p) => p.slug === group.slug && p.sidebar_group === group.id
-          )
-          if (groupPages.length === 0) return null
-          const isCollapsed = collapsed[`plugin-${group.slug}-${group.id}`] ?? false
-          const storageKey = `plugin-${group.slug}-${group.id}`
-          return (
-            <div key={storageKey} className="mb-1">
-              {group.collapsible !== false ? (
-                <button
-                  onClick={() => toggleGroup(storageKey)}
-                  className="w-full flex items-center justify-between px-3 py-1.5 mt-2 group cursor-pointer"
-                >
-                  <span className="text-[10px] uppercase tracking-wider text-[#667085] font-semibold select-none">
-                    {group.label}
-                  </span>
-                  <ChevronDown
-                    size={12}
-                    className={`text-[#667085] transition-transform duration-200 group-hover:text-[#D0D5DD] ${
-                      isCollapsed ? '-rotate-90' : ''
-                    }`}
-                  />
-                </button>
-              ) : (
-                <div className="px-3 py-1.5">
-                  <span className="text-[10px] uppercase tracking-wider text-[#667085] font-semibold">
-                    {group.label}
-                  </span>
-                </div>
-              )}
-              <div
-                className={`overflow-hidden transition-all duration-200 ease-in-out ${
-                  group.collapsible !== false && isCollapsed ? 'max-h-0 opacity-0' : 'max-h-96 opacity-100'
-                }`}
-              >
-                <div className="flex flex-col gap-0.5">
-                  {[...groupPages]
-                    .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
-                    .map((page) => {
-                      const PageIcon = resolveLucideIcon(page.icon, Puzzle)
-                      return (
-                        <NavLink
-                          key={`${page.slug}-${page.id}`}
-                          to={`/plugins-ui/${page.slug}/${page.path}`}
-                          onClick={() => setMobileOpen(false)}
-                          className={({ isActive }) =>
-                            `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors border-l-2 ${
-                              isActive
-                                ? 'text-[#00FFA7] bg-[#00FFA7]/10 border-[#00FFA7]'
-                                : 'text-[#667085] hover:text-[#D0D5DD] hover:bg-white/5 border-transparent'
-                            }`
-                          }
-                        >
-                          <PageIcon size={16} />
-                          {page.label}
-                        </NavLink>
-                      )
-                    })}
-                </div>
-              </div>
-            </div>
-          )
-        })}
+        {navGroups.map((group) => (
+          <Fragment key={group.key}>
+            {renderGroup(group)}
+            {renderPluginGroupsForPosition(`after:${group.key}`)}
+          </Fragment>
+        ))}
+        {renderPluginGroupsForPosition(DEFAULT_PLUGIN_POSITION)}
 
         {/* Docs link — standalone at the bottom of nav */}
         <div className="mt-2">
