@@ -738,6 +738,19 @@ with app.app_context():
         print(f"WARNING: plugin crash recovery failed: {_cr_exc}")
     # --- End plugin crash recovery ---
 
+    # --- Plugin runtime sync ---
+    # Rebuild ephemeral plugin resources and reconcile auto-installable
+    # dependencies after container/image restarts. Installed plugin sources are
+    # persistent; runtime packages and .claude resources may be ephemeral.
+    try:
+        from plugin_runtime_sync import sync_plugin_resources as _sync_plugin_resources
+        _plugin_sync = _sync_plugin_resources(WORKSPACE)
+        if _plugin_sync.get("errors"):
+            print(f"WARNING: plugin runtime sync errors: {_plugin_sync['errors']}")
+    except Exception as _sync_exc:
+        print(f"WARNING: plugin runtime sync failed: {_sync_exc}")
+    # --- End plugin runtime sync ---
+
     # Cleanup: remove old disabled share records (expired + disabled + older than 30 days)
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     from models import FileShare as _FileShare

@@ -222,6 +222,67 @@ CREATE TABLE plugin_orphans (
 
 ---
 
+## `dependencies` - Auto-Installed Runtime Packages
+
+Plugins may declare Python packages that EvoNexus installs automatically during plugin install, plugin update, and backend startup. Startup reconciliation lets Docker containers recreate ephemeral runtime packages after an image/container restart.
+
+Preferred shape:
+
+```yaml
+dependencies:
+  python:
+    packages:
+      python-docx: ">=1.1,<2"
+      pyyaml: ">=6.0"
+```
+
+Backward-compatible flat shape is also accepted:
+
+```yaml
+dependencies:
+  python-docx: ">=1.1,<2"
+```
+
+Rules:
+
+1. EvoNexus installs Python packages with `uv pip install --python <runtime-python>` when `uv` is available, otherwise with `python -m pip install`.
+2. Dependency install failure blocks a new install/update. On backend startup, failure marks the existing plugin as `broken` with `last_error`.
+3. Uninstall does not remove Python packages, because another plugin may use the same package.
+4. Only package names and version specifiers are accepted. Arbitrary shell commands are not supported.
+
+---
+
+## `prerequisites` - External Requirements And Operator Warnings
+
+Use prerequisites for things EvoNexus should not install automatically, such as external MCP servers, CLI tools, credentials, or manual setup steps. Missing required prerequisites do not uninstall or disable the plugin; they are surfaced in the plugin UI as attention items.
+
+```yaml
+prerequisites:
+  - id: google-mcp
+    type: mcp
+    name: google
+    label: "Google MCP"
+    required: true
+    instructions: "Configure the Google MCP server before using document import."
+
+  - id: google-credentials
+    type: env
+    key: GOOGLE_APPLICATION_CREDENTIALS
+    label: "Google credentials"
+    required: true
+```
+
+Supported `type` values:
+
+| Type | Required field | Check |
+|---|---|---|
+| `env` | `key` | Environment variable exists |
+| `mcp` / `external_mcp` | `name` | MCP name exists in `.claude.json` |
+| `cli` | `name` | CLI executable is available on `PATH` |
+| `manual` | none | Always shown as an operator/manual prerequisite |
+
+---
+
 ## Changelog
 
 | Version | Change |

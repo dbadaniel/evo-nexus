@@ -294,6 +294,19 @@ export default function PluginDetail() {
     ? manifest['mcp_servers_installed'] as Array<{ effective_name: string }>
     : []
 
+  const runtimeStatus = (manifest['runtime_status'] as Record<string, unknown> | undefined) ?? {}
+  const dependencyStatus = (plugin.dependency_status as Record<string, unknown> | null | undefined)
+    ?? (runtimeStatus['dependencies'] as Record<string, unknown> | undefined)
+  const prerequisiteStatus = (plugin.prerequisites_status as Record<string, unknown> | null | undefined)
+    ?? (runtimeStatus['prerequisites'] as Record<string, unknown> | undefined)
+  const prerequisiteItems = Array.isArray(prerequisiteStatus?.['items'])
+    ? prerequisiteStatus['items'] as Array<Record<string, unknown>>
+    : []
+  const dependencyPython = (dependencyStatus?.['python'] as Record<string, unknown> | undefined) ?? {}
+  const dependencyPackages = Array.isArray(dependencyPython['packages'])
+    ? dependencyPython['packages'] as Array<Record<string, unknown>>
+    : []
+
   // ---------------------------------------------------------------------------
   // Build capability items from manifest + capabilities_disabled
   // ---------------------------------------------------------------------------
@@ -521,6 +534,25 @@ export default function PluginDetail() {
         </div>
       )}
 
+      {(plugin.status === 'broken' || prerequisiteStatus?.['status'] === 'needs_attention') && (
+        <div className="mb-4 bg-yellow-500/5 border border-yellow-500/20 rounded-xl px-4 py-3 flex items-start gap-3">
+          <AlertTriangle size={15} className="text-yellow-300 mt-0.5 shrink-0" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-yellow-200 mb-1">
+              Plugin precisa de atencao
+            </p>
+            {plugin.status === 'broken' && plugin.last_error && (
+              <p className="text-xs text-yellow-100/70 mb-2">{plugin.last_error}</p>
+            )}
+            {prerequisiteItems.filter((item) => item['ok'] === false).map((item) => (
+              <p key={String(item['id'] ?? item['label'])} className="text-xs text-yellow-100/70">
+                {String(item['label'] ?? item['id'])}: {String(item['detail'] ?? 'configuracao pendente')}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Wave 2.3 — MCP restart banner (persistent until dismissed) */}
       {mcpServersInstalled.length > 0 && !mcpBannerDismissed && (
         <div className="mb-4 bg-blue-500/5 border border-blue-500/20 rounded-xl px-4 py-3 flex items-start gap-3">
@@ -578,6 +610,18 @@ export default function PluginDetail() {
                 {capabilities.map((cap) => (
                   <span key={cap} className="text-xs bg-[#00FFA7]/10 text-[#00FFA7] border border-[#00FFA7]/20 px-2 py-0.5 rounded-full">
                     {cap}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {dependencyPackages.length > 0 && (
+            <div className="mt-4 pt-4 border-t border-[#21262d]">
+              <p className="text-xs text-[#667085] mb-2">Dependencias Python</p>
+              <div className="flex flex-wrap gap-1.5">
+                {dependencyPackages.map((pkg) => (
+                  <span key={String(pkg['name'])} className="text-xs bg-[#21262d] text-[#D0D5DD] border border-[#344054] px-2 py-0.5 rounded-full">
+                    {String(pkg['name'])}{pkg['specifier'] ? String(pkg['specifier']) : ''}
                   </span>
                 ))}
               </div>

@@ -76,6 +76,9 @@ def _plugin_to_dict(row: sqlite3.Row) -> dict:
         manifest = json.loads(d.get("manifest_json") or "{}")
         metadata = manifest.get("metadata") or {}
         icon_path = metadata.get("icon")
+        runtime_status = manifest.get("runtime_status") or {}
+        d["dependency_status"] = runtime_status.get("dependencies")
+        d["prerequisites_status"] = runtime_status.get("prerequisites")
         if icon_path and isinstance(icon_path, str) and icon_path.startswith("ui/"):
             slug = d.get("slug", "")
             # icon_path is e.g. "ui/assets/icon.png"; strip the "ui/" prefix for URL
@@ -84,6 +87,8 @@ def _plugin_to_dict(row: sqlite3.Row) -> dict:
             d["icon_url"] = None
     except Exception:
         d["icon_url"] = None
+        d["dependency_status"] = None
+        d["prerequisites_status"] = None
     return d
 
 
@@ -889,6 +894,18 @@ def install_plugin():
         state["completed_steps"].append({"step": "copy_source"})
         save_state(slug, state)
 
+        # --- Step: auto-install declared runtime dependencies ---
+        try:
+            from plugin_dependency_manager import reconcile_plugin_runtime
+            runtime_status = reconcile_plugin_runtime(slug, manifest)
+        except Exception as exc:
+            raise RuntimeError(f"Plugin dependency install failed: {exc}") from exc
+        state["completed_steps"].append({
+            "step": "runtime_dependencies",
+            "runtime_status": runtime_status,
+        })
+        save_state(slug, state)
+
         # --- Step: pre-install hook ---
         pre_hook = plugin_dir / "hooks" / "pre-install.sh"
         if pre_hook.exists():
@@ -1128,6 +1145,7 @@ def install_plugin():
         # Wave 2.3: store mcp_servers_installed in manifest_json for uninstall/update
         # Uses a separate key to avoid overwriting the declared mcp_servers field.
         manifest_for_db = dict(manifest)
+        manifest_for_db["runtime_status"] = runtime_status
         if mcp_installed_records:
             manifest_for_db["mcp_servers_installed"] = mcp_installed_records
 
@@ -1173,6 +1191,7 @@ def install_plugin():
         write_runtime_state(plugin_dir, enabled=True, capabilities_disabled={})
 
         _audit(conn, slug, "install", {"source_url": source_url}, success=True)
+        _audit(conn, slug, "runtime_dependencies", runtime_status, success=True)
         invalidate_agent_meta_cache()
         lock.__exit__(None, None, None)
 
@@ -1182,6 +1201,7 @@ def install_plugin():
             "routine_activation_pending": routine_error is not None,
             "warnings": preview.get("warnings", []),
             "mcp_servers_installed": mcp_installed_records,
+            "runtime_status": runtime_status,
         })
 
     except _WidgetLimitError as exc:
@@ -2968,6 +2988,17 @@ def update_plugin(slug: str):
                 "new_sql_sha": new_sql_sha,
             }), 409
 
+        # 8. Runtime dependencies are installed before replacing files so a
+        # dependency failure does not leave the plugin half-updated.
+        try:
+            from plugin_dependency_manager import reconcile_plugin_runtime
+            runtime_status = reconcile_plugin_runtime(slug, new_manifest.model_dump())
+        except Exception as exc:
+            return jsonify({
+                "error": "dependency_install_failed",
+                "message": str(exc),
+            }), 500
+
         # 8. AC11: Copy new knowledge layer files in place
         # Reuse copy_with_manifest — it handles namespace enforcement and SHA tracking
         plugin_dir = PLUGINS_DIR / slug
@@ -3035,6 +3066,7 @@ def update_plugin(slug: str):
 
         # 10. Build updated manifest dict
         new_manifest_dict = new_manifest.model_dump()
+        new_manifest_dict["runtime_status"] = runtime_status
 
         # 11. Wave 1.1: prune capabilities_disabled for IDs that no longer exist in new manifest.
         # IDs that persist keep their disabled state. IDs removed by the new version are pruned.
@@ -3116,6 +3148,7 @@ def update_plugin(slug: str):
 
         # 13. Audit log
         _audit(conn, slug, "update", {"from": installed_version, "to": new_version, "sql_sha_preserved": True})
+        _audit(conn, slug, "runtime_dependencies", runtime_status, success=True)
         invalidate_agent_meta_cache()
 
         return jsonify({
@@ -3124,6 +3157,7 @@ def update_plugin(slug: str):
             "from_version": installed_version,
             "to_version": new_version,
             "mcp_delta": mcp_delta_result,
+            "runtime_status": runtime_status,
         })
 
     except Exception as exc:

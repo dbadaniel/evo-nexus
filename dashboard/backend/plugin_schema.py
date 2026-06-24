@@ -922,6 +922,31 @@ class PluginUIEntryPoints(BaseModel):
     sidebar_groups: Optional[List[PluginSidebarGroup]] = None
 
 
+class PluginPrerequisite(BaseModel):
+    """External prerequisite declared by a plugin.
+
+    EvoNexus validates and reports prerequisites, but does not install them.
+    Use this for things like external MCP servers, CLI tools, API credentials,
+    or manual setup steps.
+    """
+
+    id: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,62}[a-z0-9]$")]
+    type: Annotated[str, Field(pattern=r"^(env|mcp|external_mcp|cli|manual)$")]
+    label: Annotated[str, Field(min_length=1, max_length=120)]
+    required: bool = True
+    instructions: Optional[Annotated[str, Field(max_length=1000)]] = None
+    key: Optional[Annotated[str, Field(pattern=r"^[A-Z_][A-Z0-9_]*$")]] = None
+    name: Optional[Annotated[str, Field(pattern=r"^[A-Za-z0-9_.@/-]{1,120}$")]] = None
+
+    @model_validator(mode="after")
+    def required_fields_for_type(self) -> "PluginPrerequisite":
+        if self.type == "env" and not self.key:
+            raise ValueError("env prerequisite requires key")
+        if self.type in {"mcp", "external_mcp", "cli"} and not self.name:
+            raise ValueError(f"{self.type} prerequisite requires name")
+        return self
+
+
 class PluginManifest(BaseModel):
     """Full plugin.yaml manifest schema for v1a."""
 
@@ -953,8 +978,19 @@ class PluginManifest(BaseModel):
     # --- Wave 2.1: Writable data resources (POST/PUT/DELETE mutations) ---
     writable_data: Optional[List[PluginWritableResource]] = None
 
-    # --- Dependencies (empty in v1a) ---
-    dependencies: Dict[str, str] = Field(default_factory=dict)
+    # --- Runtime dependencies ---
+    # Preferred shape:
+    # dependencies:
+    #   python:
+    #     packages:
+    #       python-docx: ">=1.1,<2"
+    # Backward-compatible flat shape is also accepted:
+    # dependencies:
+    #   python-docx: ">=1.1,<2"
+    dependencies: Dict[str, Any] = Field(default_factory=dict)
+
+    # --- External prerequisites (validated, not auto-installed) ---
+    prerequisites: List[PluginPrerequisite] = Field(default_factory=list)
 
     # --- Claude hooks (step 8, validated here for schema completeness) ---
     claude_hooks: List[ClaudeHookSpec] = Field(default_factory=list)
@@ -996,6 +1032,19 @@ class PluginManifest(BaseModel):
             raise ValueError(
                 f"Plugin id '{v}' must match ^[a-z0-9][a-z0-9-]{{1,62}}[a-z0-9]$"
             )
+        return v
+
+    @field_validator("dependencies")
+    @classmethod
+    def dependencies_supported_shape(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            try:
+                from plugin_dependency_manager import normalize_python_packages
+            except ImportError:
+                from dashboard.backend.plugin_dependency_manager import normalize_python_packages
+            normalize_python_packages(v)
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
         return v
 
     @field_validator("version", "min_evonexus_version")

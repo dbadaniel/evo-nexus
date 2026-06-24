@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,9 @@ from plugin_file_ops import RUNTIME_STATE_FILENAME, copy_with_manifest
 
 log = logging.getLogger(__name__)
 WORKSPACE = Path(__file__).resolve().parent.parent.parent
+DB_PATH = WORKSPACE / "dashboard" / "data" / "evonexus.db"
 RESOURCE_TYPES = ("agents", "skills", "commands", "rules")
+_DEPENDENCY_ERROR_PREFIX = "Plugin dependency install failed:"
 
 
 def _runtime_state(plugin_dir: Path) -> dict[str, Any]:
@@ -67,6 +70,49 @@ def _write_rules_index(workspace: Path, blocks: list[tuple[str, list[str]]]) -> 
     index_path.write_text(content + ("\n" if content else ""), encoding="utf-8")
 
 
+def _update_runtime_status(
+    slug: str,
+    manifest: dict[str, Any],
+    runtime_status: dict[str, Any] | None,
+    error: str | None = None,
+) -> None:
+    if not DB_PATH.is_file():
+        return
+    manifest_for_db = dict(manifest)
+    if runtime_status is not None:
+        manifest_for_db["runtime_status"] = runtime_status
+    status = "broken" if error else "active"
+    last_error = f"{_DEPENDENCY_ERROR_PREFIX} {error}" if error else None
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10)
+        try:
+            row = conn.execute(
+                "SELECT status, last_error FROM plugins_installed WHERE slug = ?",
+                (slug,),
+            ).fetchone()
+            if not row:
+                return
+            current_status, current_error = row
+            if (
+                not error
+                and current_status == "broken"
+                and isinstance(current_error, str)
+                and current_error.startswith(_DEPENDENCY_ERROR_PREFIX)
+            ):
+                status = "active"
+            elif not error:
+                status = current_status or "active"
+            conn.execute(
+                "UPDATE plugins_installed SET manifest_json = ?, status = ?, last_error = ? WHERE slug = ?",
+                (json.dumps(manifest_for_db), status, last_error, slug),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("Could not persist runtime status for plugin %s: %s", slug, exc)
+
+
 def sync_plugin_resources(workspace: Path = WORKSPACE) -> dict[str, Any]:
     plugins_dir = workspace / "plugins"
     _clean_namespaced_resources(workspace)
@@ -93,6 +139,15 @@ def sync_plugin_resources(workspace: Path = WORKSPACE) -> dict[str, Any]:
             if slug != plugin_dir.name:
                 raise ValueError("plugin id must match its persistent directory name")
             disabled = state["capabilities_disabled"]
+
+            try:
+                from plugin_dependency_manager import reconcile_plugin_runtime
+                runtime_status = reconcile_plugin_runtime(slug, manifest)
+                manifest["runtime_status"] = runtime_status
+                _update_runtime_status(slug, manifest, runtime_status)
+            except Exception as dep_exc:
+                _update_runtime_status(slug, manifest, None, str(dep_exc))
+                raise RuntimeError(f"runtime dependency reconcile failed: {dep_exc}") from dep_exc
 
             for resource_type in RESOURCE_TYPES:
                 source = plugin_dir / resource_type

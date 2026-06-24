@@ -18,6 +18,21 @@ export interface Plugin {
   capabilities_disabled?: string
   // Wave 2.0: plugin icon URL served by /plugins/<slug>/ui/<path>
   icon_url?: string | null
+  dependency_status?: RuntimeDependencyStatus | null
+  prerequisites_status?: PrerequisiteStatus | null
+}
+
+interface RuntimeDependencyStatus {
+  status?: string
+  python?: {
+    packages?: Array<{ name: string; specifier?: string }>
+    installer?: string | null
+  }
+}
+
+interface PrerequisiteStatus {
+  status?: 'ok' | 'needs_attention'
+  items?: Array<{ id?: string; label?: string; ok?: boolean; required?: boolean }>
 }
 
 interface Props {
@@ -59,6 +74,7 @@ export default function PluginCard({ plugin, onClick, onToggle }: Props) {
   }
 
   const showIcon = !iconError && !!plugin.icon_url
+  const needsAttention = plugin.prerequisites_status?.status === 'needs_attention'
 
   return (
     <div
@@ -128,6 +144,12 @@ export default function PluginCard({ plugin, onClick, onToggle }: Props) {
           </span>
         )}
       </div>
+
+      {needsAttention && (
+        <p className="mt-2 text-[11px] text-yellow-300/80 truncate" title="Plugin prerequisites need attention">
+          Prerequisites need attention
+        </p>
+      )}
 
       {plugin.status === 'broken' && plugin.last_error && (
         <p className="mt-2 text-[11px] text-red-400/80 truncate" title={plugin.last_error}>
