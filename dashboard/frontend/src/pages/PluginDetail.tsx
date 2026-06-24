@@ -306,6 +306,7 @@ export default function PluginDetail() {
   const dependencyPackages = Array.isArray(dependencyPython['packages'])
     ? dependencyPython['packages'] as Array<Record<string, unknown>>
     : []
+  const dependenciesInstalled = dependencyStatus?.['status'] === 'installed'
 
   // ---------------------------------------------------------------------------
   // Build capability items from manifest + capabilities_disabled
@@ -620,7 +621,14 @@ export default function PluginDetail() {
               <p className="text-xs text-[#667085] mb-2">Dependencias Python</p>
               <div className="flex flex-wrap gap-1.5">
                 {dependencyPackages.map((pkg) => (
-                  <span key={String(pkg['name'])} className="text-xs bg-[#21262d] text-[#D0D5DD] border border-[#344054] px-2 py-0.5 rounded-full">
+                  <span
+                    key={String(pkg['name'])}
+                    className={`text-xs px-2 py-0.5 rounded-full border ${
+                      dependenciesInstalled
+                        ? 'bg-[#00FFA7]/10 text-[#00FFA7] border-[#00FFA7]/20'
+                        : 'bg-[#21262d] text-[#D0D5DD] border-[#344054]'
+                    }`}
+                  >
                     {String(pkg['name'])}{pkg['specifier'] ? String(pkg['specifier']) : ''}
                   </span>
                 ))}
