@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,15 @@ bp = Blueprint("plugins", __name__)
 WORKSPACE = Path(__file__).resolve().parent.parent.parent.parent
 PLUGINS_DIR = WORKSPACE / "plugins"
 DB_PATH = WORKSPACE / "dashboard" / "data" / "evonexus.db"
+COMMANDS_DIR = WORKSPACE / ".claude" / "commands"
+
+_COMMAND_ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,78}[a-z0-9]$|^[a-z0-9]$")
+_CORE_COMMAND_ALIASES = {
+    "aria", "atlas-project", "clawdia", "dex", "flux", "kai", "lex",
+    "mako", "mentor", "nex", "nova", "oracle", "pixel", "pulse", "sage",
+    "helm-conductor", "mirror-retro",
+}
+_ALIAS_MARKER_PREFIX = "<!-- evonexus-plugin-command-alias "
 
 
 def _now_iso() -> str:
@@ -62,6 +72,146 @@ def _audit(conn: sqlite3.Connection, slug: str, action: str, payload: Any = None
         conn.commit()
     except Exception as exc:
         logger.warning("audit log write failed: %s", exc)
+
+
+def _manifest_command_aliases(slug: str, manifest: dict) -> list[dict[str, str]]:
+    """Return generated public command aliases for plugin agents."""
+    prefix = (manifest.get("command_prefix") or "").strip()
+    if not prefix:
+        return []
+
+    aliases: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for agent_entry in manifest.get("agents") or []:
+        file_path = agent_entry.get("file") or ""
+        if not file_path:
+            continue
+        agent_file_slug = Path(file_path).stem
+        command_name = (agent_entry.get("command_name") or agent_file_slug).strip()
+        alias = f"{prefix}-{command_name}"
+        if not _COMMAND_ALIAS_RE.match(alias):
+            raise ValueError(f"Invalid generated command alias '{alias}'")
+        if alias in seen:
+            raise ValueError(f"Duplicate generated command alias '/{alias}'")
+        seen.add(alias)
+        aliases.append({
+            "alias": alias,
+            "agent": f"plugin-{slug}-{agent_file_slug}",
+            "agent_file_slug": agent_file_slug,
+        })
+    return aliases
+
+
+def _alias_owned_by_plugin(path: Path, slug: str) -> bool:
+    if not path.exists():
+        return False
+    try:
+        first_line = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    except Exception:
+        return False
+    return first_line.startswith(_ALIAS_MARKER_PREFIX) and f"slug:{slug} " in first_line
+
+
+def _validate_command_aliases(slug: str, manifest: dict, conn: sqlite3.Connection | None = None) -> list[dict[str, str]]:
+    aliases = _manifest_command_aliases(slug, manifest)
+    if not aliases:
+        return []
+
+    prefix = (manifest.get("command_prefix") or "").strip()
+    db_conn = conn
+    close_conn = False
+    if db_conn is None:
+        db_conn = _get_db()
+        close_conn = True
+    try:
+        rows = db_conn.execute(
+            "SELECT slug, manifest_json FROM plugins_installed WHERE slug <> ?",
+            (slug,),
+        ).fetchall()
+        for row in rows:
+            try:
+                other_manifest = json.loads(row["manifest_json"] or "{}")
+            except Exception:
+                continue
+            if (other_manifest.get("command_prefix") or "").strip() == prefix:
+                raise ValueError(
+                    f"command_prefix '{prefix}' is already used by plugin '{row['slug']}'"
+                )
+    finally:
+        if close_conn:
+            db_conn.close()
+
+    for spec in aliases:
+        alias = spec["alias"]
+        if alias in _CORE_COMMAND_ALIASES:
+            raise ValueError(f"Generated command alias '/{alias}' conflicts with a native command")
+        target = COMMANDS_DIR / f"{alias}.md"
+        disabled_target = COMMANDS_DIR / f"{alias}.md.disabled"
+        if target.exists() and not _alias_owned_by_plugin(target, slug):
+            raise ValueError(f"Generated command alias '/{alias}' conflicts with existing command file")
+        if disabled_target.exists() and not _alias_owned_by_plugin(disabled_target, slug):
+            raise ValueError(f"Generated command alias '/{alias}' conflicts with disabled command file")
+    return aliases
+
+
+def _write_command_aliases(slug: str, manifest: dict, manifest_list: list[dict]) -> list[dict]:
+    """Create public slash-command alias files and append records to manifest_list."""
+    aliases = _validate_command_aliases(slug, manifest)
+    if not aliases:
+        return []
+
+    COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+    added: list[dict] = []
+    for spec in aliases:
+        alias = spec["alias"]
+        agent = spec["agent"]
+        dest = COMMANDS_DIR / f"{alias}.md"
+        content = (
+            f"{_ALIAS_MARKER_PREFIX}slug:{slug} agent:{agent} -->\n"
+            f"Use the @{agent} agent to help the user with the following request: $ARGUMENTS\n\n"
+            "If no arguments were provided, ask the user how you can help.\n"
+        )
+        dest.write_text(content, encoding="utf-8")
+        sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        record = {
+            "src": "generated:command_alias",
+            "dest": str(dest),
+            "sha256": sha256,
+            "category": "commands",
+            "generated": True,
+            "command_alias": alias,
+            "agent": agent,
+        }
+        manifest_list.append(record)
+        added.append(record)
+    return added
+
+
+def _toggle_command_aliases(slug: str, manifest: dict, enabled: bool) -> None:
+    for spec in _manifest_command_aliases(slug, manifest):
+        enabled_path = COMMANDS_DIR / f"{spec['alias']}.md"
+        disabled_path = COMMANDS_DIR / f"{spec['alias']}.md.disabled"
+        try:
+            if enabled:
+                if disabled_path.exists() and _alias_owned_by_plugin(disabled_path, slug):
+                    disabled_path.rename(enabled_path)
+            else:
+                if enabled_path.exists() and _alias_owned_by_plugin(enabled_path, slug):
+                    enabled_path.rename(disabled_path)
+        except OSError as exc:
+            logger.warning("command alias toggle failed for /%s: %s", spec["alias"], exc)
+
+
+def _remove_stale_command_aliases(slug: str, old_manifest: dict, new_manifest: dict) -> None:
+    old_aliases = {spec["alias"] for spec in _manifest_command_aliases(slug, old_manifest)}
+    new_aliases = {spec["alias"] for spec in _manifest_command_aliases(slug, new_manifest)}
+    for alias in sorted(old_aliases - new_aliases):
+        for path in (COMMANDS_DIR / f"{alias}.md", COMMANDS_DIR / f"{alias}.md.disabled"):
+            if path.exists() and _alias_owned_by_plugin(path, slug):
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    logger.warning("stale command alias removal failed for /%s: %s", alias, exc)
 
 
 def _plugin_to_dict(row: sqlite3.Row) -> dict:
@@ -786,6 +936,16 @@ def install_plugin():
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 409
 
+    try:
+        _alias_check_conn = _get_db()
+        try:
+            _validate_command_aliases(slug, manifest, conn=_alias_check_conn)
+        finally:
+            _alias_check_conn.close()
+    except Exception as exc:
+        lock.__exit__(None, None, None)
+        return jsonify({"error": "command_alias_conflict", "message": str(exc)}), 409
+
     # B3: Check for orphaned tables from a previous uninstall (safe_uninstall).
     # If orphans exist, verify SHA256 to prevent hostile reinstall (Vault B3.S3).
     _orphan_check_conn = _get_db()
@@ -961,6 +1121,7 @@ def install_plugin():
         command_files: list[dict] = []
         if commands_src.exists():
             copy_with_manifest(commands_src, commands_dst, slug, "commands", command_files)
+        _write_command_aliases(slug, manifest, command_files)
         state["completed_steps"].append({"step": "copy_commands", "copied_files": command_files})
         save_state(slug, state)
 
@@ -1655,7 +1816,7 @@ def update_plugin_status(slug: str):
     conn = _get_db()
     try:
         row = conn.execute(
-            "SELECT id, capabilities_disabled FROM plugins_installed WHERE slug = ?", (slug,)
+            "SELECT id, capabilities_disabled, manifest_json FROM plugins_installed WHERE slug = ?", (slug,)
         ).fetchone()
         if not row:
             return jsonify({"error": "Plugin not found"}), 404
@@ -1667,11 +1828,16 @@ def update_plugin_status(slug: str):
             caps_disabled: dict = json.loads(row["capabilities_disabled"] or "{}")
         except (json.JSONDecodeError, TypeError):
             caps_disabled = {}
+        try:
+            manifest_for_aliases: dict = json.loads(row["manifest_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            manifest_for_aliases = {}
 
         from plugin_file_ops import _toggle_file_disabled
         plugin_prefix = f"plugin-{slug}-"
 
         if not enabled:
+            _toggle_command_aliases(slug, manifest_for_aliases, enabled=False)
             # Plugin OFF: disable ALL .claude/{agents,skills,commands}/plugin-{slug}-* entries
             # Handles both .md files (agents/commands) and directories (skill bundles)
             for cap_type in ("agents", "skills", "commands"):
@@ -1692,6 +1858,7 @@ def update_plugin_status(slug: str):
                     except OSError as exc:
                         logger.warning("plugin OFF rename failed for %s: %s", entry, exc)
         else:
+            _toggle_command_aliases(slug, manifest_for_aliases, enabled=True)
             # Plugin ON: re-enable .disabled entries EXCEPT those in capabilities_disabled
             for cap_type in ("agents", "skills", "commands"):
                 target_dir = WORKSPACE / ".claude" / cap_type
@@ -2999,6 +3166,14 @@ def update_plugin(slug: str):
                 "message": str(exc),
             }), 500
 
+        try:
+            _validate_command_aliases(slug, new_manifest.model_dump(), conn=conn)
+        except Exception as exc:
+            return jsonify({
+                "error": "command_alias_conflict",
+                "message": str(exc),
+            }), 409
+
         # 8. AC11: Copy new knowledge layer files in place
         # Reuse copy_with_manifest — it handles namespace enforcement and SHA tracking
         plugin_dir = PLUGINS_DIR / slug
@@ -3019,6 +3194,8 @@ def update_plugin(slug: str):
         commands_src = new_plugin_dir / "commands"
         if commands_src.exists():
             copy_with_manifest(commands_src, WORKSPACE / ".claude" / "commands", slug, "commands", command_files)
+        _remove_stale_command_aliases(slug, installed_manifest_dict, new_manifest.model_dump())
+        _write_command_aliases(slug, new_manifest.model_dump(), command_files)
 
         rules_src = new_plugin_dir / "rules"
         if rules_src.exists():
@@ -3254,6 +3431,12 @@ def _build_agent_meta_response() -> dict:
                 or agent_entry.get("label")
                 or " ".join(part.capitalize() for part in filename.split("-") if part)
             )
+            command_alias = None
+            command_prefix = (manifest.get("command_prefix") or "").strip()
+            if command_prefix:
+                command_name = (agent_entry.get("command_name") or filename).strip()
+                if command_name:
+                    command_alias = f"/{command_prefix}-{command_name}"
             avatar_url: str | None = None
             if avatar_path:
                 # avatar_path is relative to plugin dir (e.g. ui/assets/avatars/pm-nova.png)
@@ -3272,6 +3455,7 @@ def _build_agent_meta_response() -> dict:
                 "category_label": agent_entry.get("category_label") or manifest.get("name", plugin_slug),
                 "icon": agent_entry.get("icon"),
                 "color": agent_entry.get("color"),
+                "command_alias": command_alias,
             }
 
     return result

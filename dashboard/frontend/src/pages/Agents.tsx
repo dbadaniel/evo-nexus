@@ -109,6 +109,7 @@ interface Agent {
   icon?: string
   category?: string
   category_label?: string
+  command_alias?: string
   plugin_slug?: string
   model?: string
   locked?: boolean
@@ -280,9 +281,9 @@ const DEFAULT_META: AgentMeta = {
 }
 
 function getMeta(name: string, agent?: Agent): AgentMeta {
-  const command = `/${name}`
   const registered = getRegisteredAgentMeta(name)
-  if (AGENT_META[name]) return { ...AGENT_META[name], command }
+  const command = agent?.command_alias || registered.command || `/${name}`
+  if (AGENT_META[name]) return AGENT_META[name]
   if (agent?.icon || agent?.color || agent?.category_label || registered.label !== 'Agent') {
     const c = agent?.color || registered.color || DEFAULT_META.color
     return {

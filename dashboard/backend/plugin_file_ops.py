@@ -618,7 +618,29 @@ def reverse_remove_from_manifest(manifest_path: Path) -> None:
     with open(manifest_path, encoding="utf-8") as f:
         data = json.load(f)
 
-    files = data.get("files", [])
+    files = list(data.get("files", []))
+    for key in ("agents", "skills", "commands", "rules", "assets"):
+        entries = data.get(key, [])
+        if isinstance(entries, list):
+            files.extend(entries)
+    for step in data.get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        for key in ("copied_files", "asset_files", "widget_files"):
+            entries = step.get(key, [])
+            if isinstance(entries, list):
+                files.extend(entries)
+
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for record in files:
+        dest = record.get("dest") if isinstance(record, dict) else None
+        if not dest or dest in seen:
+            continue
+        seen.add(dest)
+        deduped.append(record)
+    files = deduped
+
     for record in reversed(files):
         dest = Path(record["dest"])
         if dest.is_dir():

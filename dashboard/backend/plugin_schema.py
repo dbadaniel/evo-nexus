@@ -150,6 +150,10 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # Integration slug: lowercase alphanum + hyphens, 1-50 chars
 _INTEGRATION_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$|^[a-z0-9]$")
 
+# Public slash-command alias pieces. The final alias is built as
+# /<command_prefix>-<agents[].command_name>.
+_COMMAND_ALIAS_PART_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$|^[a-z0-9]$")
+
 
 class EnvVarSpec(BaseModel):
     """A single environment variable declared in a plugin integration."""
@@ -438,6 +442,7 @@ class PluginAgentEntry(BaseModel):
     category_label: Optional[str] = None
     icon: Optional[str] = None
     color: Optional[str] = None
+    command_name: Optional[str] = None
 
     @field_validator("file")
     @classmethod
@@ -484,6 +489,18 @@ class PluginAgentEntry(BaseModel):
                 "agents[].category must be 1-64 chars: lowercase letters, "
                 "digits, underscore or hyphen; it must start with a digit/letter."
             )
+        return v
+
+    @field_validator("command_name")
+    @classmethod
+    def command_name_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not _COMMAND_ALIAS_PART_RE.match(v):
+                raise ValueError(
+                    "agents[].command_name must be kebab-case, 1-40 chars, "
+                    "lowercase letters/digits/hyphens, and start/end alphanumeric."
+                )
         return v
 
     @field_validator("category_label")
@@ -958,6 +975,7 @@ class PluginManifest(BaseModel):
     author: Annotated[str, Field(min_length=1, max_length=200)]
     license: Annotated[str, Field(min_length=1, max_length=100)]
     homepage: Optional[str] = None
+    command_prefix: Optional[str] = None
 
     # --- Compatibility ---
     min_evonexus_version: Annotated[str, Field(min_length=5, max_length=50)]
@@ -1033,6 +1051,34 @@ class PluginManifest(BaseModel):
                 f"Plugin id '{v}' must match ^[a-z0-9][a-z0-9-]{{1,62}}[a-z0-9]$"
             )
         return v
+
+    @field_validator("command_prefix")
+    @classmethod
+    def command_prefix_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not _COMMAND_ALIAS_PART_RE.match(v):
+                raise ValueError(
+                    "command_prefix must be kebab-case, 1-40 chars, "
+                    "lowercase letters/digits/hyphens, and start/end alphanumeric."
+                )
+        return v
+
+    @model_validator(mode="after")
+    def agent_command_names_unique(self) -> "PluginManifest":
+        if not self.command_prefix or not self.agents:
+            return self
+        seen: set[str] = set()
+        for agent in self.agents:
+            command_name = agent.command_name or Path(agent.file).stem
+            if not _COMMAND_ALIAS_PART_RE.match(command_name):
+                raise ValueError(
+                    f"agent command name '{command_name}' must be kebab-case when command_prefix is set."
+                )
+            if command_name in seen:
+                raise ValueError(f"duplicate agent command_name '{command_name}' for command_prefix aliases")
+            seen.add(command_name)
+        return self
 
     @field_validator("dependencies")
     @classmethod

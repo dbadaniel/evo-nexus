@@ -27,6 +27,16 @@ def _format_agent_label(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.split("-") if part)
 
 
+def _plugin_agent_command_alias(plugin_slug: str, manifest: dict, agent_entry: dict, agent_file_slug: str) -> str | None:
+    command_prefix = (manifest.get("command_prefix") or "").strip()
+    if not command_prefix:
+        return None
+    command_name = (agent_entry.get("command_name") or agent_file_slug).strip()
+    if not command_name:
+        return None
+    return f"/{command_prefix}-{command_name}"
+
+
 def _plugin_agent_metadata() -> dict[str, dict]:
     """Return UI metadata for agents declared by active plugins."""
     if not DB_PATH.exists():
@@ -67,6 +77,9 @@ def _plugin_agent_metadata() -> dict[str, dict]:
                 "category": agent_entry.get("category") or f"plugin-{plugin_slug}",
                 "category_label": agent_entry.get("category_label") or plugin_name,
             }
+            command_alias = _plugin_agent_command_alias(plugin_slug, manifest, agent_entry, agent_file_slug)
+            if command_alias:
+                entry["command_alias"] = command_alias
             for key in ("icon", "color"):
                 if agent_entry.get(key):
                     entry[key] = agent_entry[key]

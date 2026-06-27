@@ -2,6 +2,8 @@
 
 This document describes the plugin.yaml schema for EvoNexus plugins, including capabilities, validated fields, and host-enforced contracts.
 
+For a practical authoring guide with examples and checklist, see [`docs/guides/building-plugins.md`](guides/building-plugins.md).
+
 ---
 
 ## plugin.yaml — Top-Level Fields
@@ -10,6 +12,7 @@ This document describes the plugin.yaml schema for EvoNexus plugins, including c
 schema_version: "1.0"       # required; must be "1.0"
 name: string                 # human-readable name
 slug: string                 # kebab-case identifier; unique across plugins
+command_prefix: string       # optional public slash-command namespace, unique across plugins
 version: string              # semver
 description: string
 author: string
@@ -36,8 +39,24 @@ A capability must be declared in `capabilities:` before the corresponding block 
 
 Plugins may declare agent markdown files and optional display metadata. The agent command and internal slug remain namespaced by the host, but `label`/`display_name` controls the title shown in the Agents UI.
 
+Plugins may also declare a public command namespace with top-level `command_prefix`. When present, EvoNexus generates friendly slash-command aliases for plugin agents using:
+
+```text
+/<command_prefix>-<agents[].command_name or agent file name>
+```
+
 ```yaml
+command_prefix: turbo
+
 agents:
+  - file: agents/copywriter.md
+    display_name: "Copywriter Turbo"
+    command_name: copywriter          # optional; defaults to file stem
+    category: lpsg
+    category_label: "Turbo Lancamento pago"
+    icon: PenTool
+    color: "#FF5C00"
+
   - file: agents/estrategista-turbo.md
     label: "Estrategista Turbo"      # optional display title
     category: lpsg
@@ -46,7 +65,18 @@ agents:
     color: "#FF5C00"
 ```
 
+In the example above, EvoNexus creates `/turbo-copywriter`, which resolves internally to the canonical agent `plugin-<plugin-slug>-copywriter`. For `estrategista-turbo.md`, because `command_name` is omitted, the generated alias is `/turbo-estrategista-turbo`.
+
 If `label`/`display_name` is omitted, EvoNexus derives the visible title from the file name (`estrategista-turbo.md` -> `Estrategista Turbo`). The internal command remains `/plugin-<plugin-slug>-<agent-file-slug>`.
+
+Rules:
+
+1. `command_prefix` and `agents[].command_name` must be kebab-case: lowercase letters, digits, and hyphens; they must start and end with an alphanumeric character.
+2. `command_prefix` must be unique across installed plugins. Install/update fails on conflict.
+3. `agents[].command_name` must be unique within a plugin when `command_prefix` is present.
+4. Generated aliases must not conflict with native commands or existing command files. Install/update fails on conflict.
+5. Disabling a plugin disables its generated command aliases. Uninstall removes them.
+6. The namespaced internal command remains the source of truth for install/update/uninstall, permissions, and auditing.
 
 ---
 

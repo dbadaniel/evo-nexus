@@ -34,6 +34,7 @@ export interface AgentMeta {
   display_name?: string | null
   category?: string | null
   category_label?: string | null
+  command_alias?: string | null
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +121,7 @@ export async function hydrateAgentMeta(force = false): Promise<void> {
       display_name?: string | null
       category?: string | null
       category_label?: string | null
+      command_alias?: string | null
     }> = await res.json()
     for (const [slug, entry] of Object.entries(data)) {
       const existing = _registry[slug]
@@ -134,6 +136,8 @@ export async function hydrateAgentMeta(force = false): Promise<void> {
           display_name: entry.display_name ?? existing.display_name,
           category: entry.category ?? existing.category,
           category_label: entry.category_label ?? existing.category_label,
+          command_alias: entry.command_alias ?? existing.command_alias,
+          command: entry.command_alias ?? existing.command,
         }
       } else {
         // Plugin agent: synthesize a new entry with defaults for icon/color/command.
@@ -141,13 +145,14 @@ export async function hydrateAgentMeta(force = false): Promise<void> {
         _registry[slug] = {
           icon: resolveLucideIcon(entry.icon, Bot),
           color: entry.color ?? '#00FFA7',
-          command: `/${slug}`,
+          command: entry.command_alias ?? `/${slug}`,
           label: entry.label || slug,
           avatar_url: entry.avatar_url,
           avatar: entry.avatar_url ?? undefined,
           display_name: entry.display_name ?? entry.label ?? slug,
           category: entry.category,
           category_label: entry.category_label,
+          command_alias: entry.command_alias,
         }
       }
     }
