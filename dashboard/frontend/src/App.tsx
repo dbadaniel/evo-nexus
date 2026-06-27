@@ -193,6 +193,7 @@ function AppContent() {
   if (
     !isOnboarding &&
     extUser &&
+    user.role === 'admin' &&
     extUser.onboarding_state !== 'completed' &&
     extUser.onboarding_state !== 'skipped'
   ) {

@@ -125,6 +125,39 @@ def test_create_user_rejects_weak_password(client):
     assert b"Password must be at least 8 characters" in response.data
 
 
+def test_create_operator_skips_owner_onboarding(client):
+    login_admin(client)
+
+    response = client.post(
+        "/api/users",
+        json={
+            "username": "ops",
+            "email": "ops@example.com",
+            "password": "Strong!234",
+            "role": "operator",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json["role"] == "operator"
+    assert response.json["onboarding_state"] == "skipped"
+
+
+def test_needs_onboarding_only_applies_to_admins(app):
+    from models import User, needs_onboarding
+
+    with app.app_context():
+        operator = User.query.filter_by(username="alice").first()
+        operator.role = "operator"
+        operator.onboarding_state = None
+
+        admin = User.query.filter_by(username="admin").first()
+        admin.onboarding_state = None
+
+        assert needs_onboarding(operator) is False
+        assert needs_onboarding(admin) is True
+
+
 def test_change_password_rejects_weak_password(client):
     login_admin(client)
 

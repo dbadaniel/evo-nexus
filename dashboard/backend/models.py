@@ -1150,7 +1150,11 @@ def needs_setup() -> bool:
 
 def needs_onboarding(user) -> bool:
     """Check if the user needs to complete the onboarding wizard."""
-    return user is not None and user.onboarding_state in (None, "pending")
+    return (
+        user is not None
+        and user.role == "admin"
+        and user.onboarding_state in (None, "pending")
+    )
 
 
 # ---------------------------------------------------------------------------

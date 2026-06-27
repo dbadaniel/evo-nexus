@@ -302,6 +302,11 @@ def create_user():
         display_name=_as_text(data.get("display_name")).strip() or username,
         role=role,
         created_by=current_user.id,
+        # The onboarding wizard configures owner/admin-level runtime settings
+        # such as provider selection and optional Brain Repo connection.
+        # Users created by an admin should enter the dashboard directly unless
+        # they are explicitly made admins themselves.
+        onboarding_state=None if role == "admin" else "skipped",
     )
     user.set_password(password)
     db.session.add(user)

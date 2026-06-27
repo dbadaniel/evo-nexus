@@ -23,7 +23,7 @@ interface OnboardingState {
 export default function OnboardingRouter() {
   const navigate = useNavigate()
   const { t } = useTranslation()
-  const { refreshUser } = useAuth()
+  const { user, refreshUser } = useAuth()
   const [flow, setFlow] = useState<Flow>(null)
   const [step, setStep] = useState(0)
   const [patToken, setPatToken] = useState('')
@@ -32,6 +32,11 @@ export default function OnboardingRouter() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    if (user && user.role !== 'admin') {
+      navigate('/agents', { replace: true })
+      return
+    }
+
     // Allow re-entry into a specific sub-flow even after onboarding is completed.
     // "?reconfigure=brain" enters the brain-repo connect step directly — used by the
     // "Configure" buttons on /backups and /settings/brain-repo when the user already
@@ -61,7 +66,7 @@ export default function OnboardingRouter() {
         // No state yet — show welcome
       })
       .finally(() => setLoading(false))
-  }, [navigate])
+  }, [navigate, user])
 
   const startFirstTime = async () => {
     try {

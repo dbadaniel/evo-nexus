@@ -859,18 +859,19 @@ export default function Agents() {
           </div>
           <div className="flex gap-2 overflow-x-auto pb-1">
             {recentNames
-              .filter(n => agents.some(a => a.name === n))
-              .map(name => {
-                const meta = AGENT_META[name] || DEFAULT_META
-                const running = isRunning(name)
+              .map(name => agents.find(a => a.name === name))
+              .filter((agent): agent is Agent => Boolean(agent))
+              .map(agent => {
+                const meta = getMeta(agent.name, agent)
+                const running = isRunning(agent.name)
                 return (
                   <Link
-                    key={name}
-                    to={`/agents/${name}`}
+                    key={agent.name}
+                    to={`/agents/${agent.name}`}
                     className="flex items-center gap-2.5 px-3 py-2 rounded-lg border border-[#21262d] bg-[#161b22] hover:border-[#30363d] hover:bg-[#1c2333] transition-all flex-shrink-0 group"
                   >
                     <div className="relative flex-shrink-0">
-                      <AgentAvatar name={name} size={28} />
+                      <AgentAvatar name={agent.name} size={28} />
                       {running && (
                         <span
                           className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#161b22]"
@@ -880,7 +881,7 @@ export default function Agents() {
                     </div>
                     <div className="flex flex-col min-w-0">
                       <span className="text-[12px] font-medium text-[#e6edf3] group-hover:text-white truncate">
-                        {name.split('-').map(w => w[0].toUpperCase() + w.slice(1)).join(' ')}
+                        {formatAgentName(agent.name, agent)}
                       </span>
                       <span className="text-[10px] font-mono" style={{ color: meta.color }}>
                         {meta.command}
