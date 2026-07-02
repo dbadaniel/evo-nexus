@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { createPortal } from 'react-dom'
-import { X, CheckCircle2, XCircle, Loader2, ExternalLink } from 'lucide-react'
+import { X, CheckCircle2, XCircle, Loader2, ExternalLink, Plug, Trash2, Upload } from 'lucide-react'
 import { api } from '../lib/api'
 import { getIntegrationMeta } from '../lib/integrationMeta'
 import IntegrationField from './IntegrationField'
@@ -24,6 +24,12 @@ type TestState =
   | { status: 'idle' }
   | { status: 'loading' }
   | { status: 'ok'; message: string; latency: number }
+  | { status: 'error'; message: string }
+
+type McpActionState =
+  | { status: 'idle' }
+  | { status: 'loading'; action: 'connect' | 'remove' }
+  | { status: 'ok'; message: string }
   | { status: 'error'; message: string }
 
 export default function IntegrationDrawer({
@@ -51,9 +57,14 @@ export default function IntegrationDrawer({
   const [showErrors, setShowErrors] = useState(false)
   const [saving, setSaving] = useState(false)
   const [testState, setTestState] = useState<TestState>({ status: 'idle' })
+  const [mcpActionState, setMcpActionState] = useState<McpActionState>({ status: 'idle' })
+  const [mcpConfiguredOverride, setMcpConfiguredOverride] = useState<boolean | null>(null)
+  const [credentialsFile, setCredentialsFile] = useState<File | null>(null)
+  const [credentialsSavedOverride, setCredentialsSavedOverride] = useState<boolean | null>(null)
 
   const drawerRef = useRef<HTMLDivElement>(null)
   const firstFocusRef = useRef<HTMLButtonElement>(null)
+  const credentialsInputRef = useRef<HTMLInputElement>(null)
 
   // Sync env values into local state when drawer opens
   useEffect(() => {
@@ -65,6 +76,10 @@ export default function IntegrationDrawer({
     setLocalValues(initial)
     setShowErrors(false)
     setTestState({ status: 'idle' })
+    setMcpActionState({ status: 'idle' })
+    setMcpConfiguredOverride(null)
+    setCredentialsFile(null)
+    setCredentialsSavedOverride(null)
   }, [isOpen, effectiveFields, envValues])
 
   // ESC key to close
@@ -179,7 +194,50 @@ export default function IntegrationDrawer({
     }
   }
 
-  const isConnected = integration?.status === 'ok'
+  const handleConfigureMcp = async () => {
+    if (!meta?.mcpServer) return
+    setMcpActionState({ status: 'loading', action: 'connect' })
+    try {
+      if (meta.mcpServer.name === 'gdrive' && credentialsFile) {
+        const form = new FormData()
+        form.append('file', credentialsFile)
+        await api.upload('/integrations/mcp/gdrive/credentials', form)
+        setCredentialsSavedOverride(true)
+      }
+      await api.post(`/integrations/mcp/${meta.mcpServer.name}`)
+      setMcpActionState({
+        status: 'ok',
+        message: meta.mcpServer.name === 'gdrive'
+          ? 'Credenciais salvas e MCP configurado. Reinicie os containers ou a sessão Claude para recarregar.'
+          : 'MCP configurado. Reinicie os containers ou a sessão Claude para recarregar.',
+      })
+      setMcpConfiguredOverride(true)
+      onSaved?.()
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Erro ao configurar MCP'
+      setMcpActionState({ status: 'error', message: msg })
+    }
+  }
+
+  const handleRemoveMcp = async () => {
+    if (!meta?.mcpServer) return
+    setMcpActionState({ status: 'loading', action: 'remove' })
+    try {
+      await api.delete(`/integrations/mcp/${meta.mcpServer.name}`)
+      setMcpActionState({
+        status: 'ok',
+        message: 'MCP removido. Reinicie os containers ou a sessão Claude para recarregar.',
+      })
+      setMcpConfiguredOverride(false)
+      onSaved?.()
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Erro ao remover MCP'
+      setMcpActionState({ status: 'error', message: msg })
+    }
+  }
+
+  const isConnected = mcpConfiguredOverride ?? (integration?.status === 'ok')
+  const hasSavedCredentials = credentialsSavedOverride ?? (meta?.mcpServer?.name === 'gdrive' && isConnected)
 
   const content = (
     <>
@@ -246,7 +304,156 @@ export default function IntegrationDrawer({
                 <p className="text-sm text-[#667085] mb-5">{meta.description}</p>
               )}
 
-              {meta?.oauthFlow ? (
+              {meta?.mcpServer ? (
+                <div className="space-y-4">
+                  <div className="rounded-xl border border-[#21262d] bg-[#161b22] p-4">
+                    <div className="flex items-center gap-2 mb-3">
+                      <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#00FFA7]/10 border border-[#00FFA7]/20">
+                        <Plug size={15} className="text-[#00FFA7]" />
+                      </div>
+                      <div>
+                        <p className="text-sm font-semibold text-[#e6edf3]">MCP remoto</p>
+                        <p className="text-[11px] text-[#667085]">Registrado no workspace atual</p>
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <div>
+                        <p className="text-[10px] uppercase tracking-wider text-[#667085] mb-1">Nome</p>
+                        <code className="block rounded-lg border border-[#21262d] bg-[#0C111D] px-3 py-2 text-xs text-[#D0D5DD] font-mono">
+                          {meta.mcpServer.name}
+                        </code>
+                      </div>
+                      {'url' in meta.mcpServer ? (
+                        <div>
+                          <p className="text-[10px] uppercase tracking-wider text-[#667085] mb-1">URL</p>
+                          <code className="block rounded-lg border border-[#21262d] bg-[#0C111D] px-3 py-2 text-xs text-[#D0D5DD] font-mono break-all">
+                            {meta.mcpServer.url}
+                          </code>
+                        </div>
+                      ) : (
+                        <>
+                          <div>
+                            <p className="text-[10px] uppercase tracking-wider text-[#667085] mb-1">Comando</p>
+                            <code className="block rounded-lg border border-[#21262d] bg-[#0C111D] px-3 py-2 text-xs text-[#D0D5DD] font-mono break-all">
+                              {meta.mcpServer.command} {meta.mcpServer.args.join(' ')}
+                            </code>
+                          </div>
+                          {meta.mcpServer.env && Object.keys(meta.mcpServer.env).length > 0 && (
+                            <div>
+                              <p className="text-[10px] uppercase tracking-wider text-[#667085] mb-1">Ambiente</p>
+                              <div className="space-y-1">
+                                {Object.entries(meta.mcpServer.env).map(([key, value]) => (
+                                  <code key={key} className="block rounded-lg border border-[#21262d] bg-[#0C111D] px-3 py-2 text-xs text-[#D0D5DD] font-mono break-all">
+                                    <span className="text-[#00FFA7]">{key}</span>
+                                    <span className="text-[#667085]">=</span>
+                                    {value}
+                                  </code>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {'note' in meta.mcpServer && meta.mcpServer.note && (
+                    <div className="rounded-xl border border-[#21262d] bg-[#0C111D] px-4 py-3">
+                      <p className="text-xs text-[#b8c0cc]">{meta.mcpServer.note}</p>
+                    </div>
+                  )}
+
+                  {meta.mcpServer.name === 'gdrive' && (
+                    <div className="rounded-xl border border-[#21262d] bg-[#161b22] p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold text-[#e6edf3]">Credenciais OAuth</p>
+                          <p className="text-xs text-[#667085] mt-1">
+                            Envie o JSON de cliente OAuth do Google Cloud.
+                          </p>
+                          {credentialsFile && (
+                            <p className="text-xs text-[#00FFA7] mt-2 font-mono truncate">
+                              {credentialsFile.name}
+                            </p>
+                          )}
+                          {!credentialsFile && hasSavedCredentials && (
+                            <p className="text-xs text-[#00FFA7] mt-2">
+                              Credenciais salvas em <code className="font-mono">/workspace/config/google/gdrive-credentials.json</code>
+                            </p>
+                          )}
+                        </div>
+                        <input
+                          ref={credentialsInputRef}
+                          type="file"
+                          accept="application/json,.json"
+                          className="hidden"
+                          onChange={(e) => {
+                            setCredentialsFile(e.target.files?.[0] ?? null)
+                            setMcpActionState({ status: 'idle' })
+                          }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => credentialsInputRef.current?.click()}
+                          className="shrink-0 flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg border border-[#21262d] text-[#D0D5DD] hover:border-[#00FFA7]/35 hover:text-[#00FFA7] transition-colors"
+                        >
+                          <Upload size={14} />
+                          Selecionar JSON
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="rounded-xl border border-[#FBBF24]/20 bg-[#FBBF24]/5 px-4 py-3">
+                    <p className="text-xs text-[#FBBF24] font-medium">Docker</p>
+                    <p className="text-xs text-[#b8c0cc] mt-1">
+                      Depois de configurar, reinicie o serviço que roda Claude para ele ler o novo MCP.
+                    </p>
+                  </div>
+
+                  {mcpActionState.status === 'ok' && (
+                    <div className="flex items-start gap-2 text-xs text-[#00FFA7] bg-[#00FFA7]/5 border border-[#00FFA7]/20 rounded-lg px-3 py-2">
+                      <CheckCircle2 size={14} className="shrink-0 mt-0.5" />
+                      <span>{mcpActionState.message}</span>
+                    </div>
+                  )}
+                  {mcpActionState.status === 'error' && (
+                    <div className="flex items-start gap-2 text-xs text-red-400 bg-red-500/5 border border-red-500/20 rounded-lg px-3 py-2">
+                      <XCircle size={14} className="shrink-0 mt-0.5" />
+                      <span>{mcpActionState.message}</span>
+                    </div>
+                  )}
+
+                  <div className="sticky bottom-0 z-10 -mx-5 flex items-center gap-3 border-t border-[#21262d] bg-[#0C111D]/95 px-5 py-4 backdrop-blur">
+                    <button
+                      type="button"
+                      onClick={handleConfigureMcp}
+                      disabled={mcpActionState.status === 'loading'}
+                      className="flex-1 flex items-center justify-center gap-1.5 text-sm px-4 py-2 rounded-lg bg-[#00FFA7] text-[#0C111D] font-semibold hover:bg-[#00e699] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                      {mcpActionState.status === 'loading' && mcpActionState.action === 'connect'
+                        ? <Loader2 size={14} className="animate-spin" />
+                        : <Plug size={14} />}
+                      {meta.mcpServer.name === 'gdrive' && credentialsFile
+                        ? 'Salvar credenciais e configurar'
+                        : isConnected ? 'Atualizar MCP' : 'Configurar MCP'}
+                    </button>
+                    {isConnected && (
+                      <button
+                        type="button"
+                        onClick={handleRemoveMcp}
+                        disabled={mcpActionState.status === 'loading'}
+                        className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg border border-red-500/25 text-red-300 hover:bg-red-500/10 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                      >
+                        {mcpActionState.status === 'loading' && mcpActionState.action === 'remove'
+                          ? <Loader2 size={14} className="animate-spin" />
+                          : <Trash2 size={14} />}
+                        Remover
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : meta?.oauthFlow ? (
                 /* OAuth integration */
                 <div className="rounded-xl border border-[#21262d] bg-[#161b22] p-5 text-center">
                   <p className="text-sm text-[#667085] mb-1">

@@ -1,6 +1,7 @@
 """Integrations endpoint — check configured integrations via env vars."""
 
 import logging
+import json
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ from flask import Blueprint, jsonify, request
 from flask_login import current_user
 
 from models import audit
+from plugin_claude_config import CLAUDE_JSON, WORKSPACE as CLAUDE_WORKSPACE, _ClaudeJsonWriter
 from routes.knowledge import _require_xhr
 
 bp = Blueprint("integrations", __name__)
@@ -36,6 +38,10 @@ DB_PATH = WORKSPACE / "dashboard" / "data" / "dashboard.db"
 # — that file owns the UI schema (labels, hints, ordering) and declares the
 # same env keys for each integration.
 INTEGRATIONS = [
+    {"name": "Google Calendar", "category": "mcp", "mcp_server": "google-calendar"},
+    {"name": "Gmail", "category": "mcp", "mcp_server": "gmail"},
+    {"name": "Google Drive", "category": "mcp", "mcp_server": "gdrive"},
+    {"name": "Google Sheets", "category": "mcp", "mcp_server": "gdrive"},
     {"name": "Omie", "keys": ["OMIE_APP_KEY", "OMIE_APP_SECRET"], "category": "erp"},
     {"name": "Bling", "keys": ["BLING_CLIENT_ID", "BLING_CLIENT_SECRET"], "category": "erp"},
     {"name": "Stripe", "keys": ["STRIPE_SECRET_KEY"], "category": "payments"},
@@ -56,7 +62,68 @@ INTEGRATIONS = [
     # embedder accepts OpenAI as an opt-in via Knowledge Settings.
 ]
 
+MCP_INTEGRATIONS = {
+    "google-calendar": {
+        "name": "Google Calendar",
+        "type": "http",
+        "url": "https://gcal.mcp.claude.com/mcp",
+    },
+    "gmail": {
+        "name": "Gmail",
+        "type": "http",
+        "url": "https://gmail.mcp.claude.com/mcp",
+    },
+    "gdrive": {
+        "name": "Google Drive",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-gdrive"],
+        "env": {
+            "GDRIVE_CREDENTIALS_PATH": str(
+                CLAUDE_WORKSPACE / "config" / "google" / "gdrive-credentials.json"
+            ),
+        },
+    },
+}
+
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
+
+
+def _workspace_mcp_servers(data: dict, create: bool = False) -> dict:
+    ws_key = str(CLAUDE_WORKSPACE.resolve())
+    if create:
+        projects = data.setdefault("projects", {})
+        project_entry = projects.setdefault(ws_key, {})
+        return project_entry.setdefault("mcpServers", {})
+    return (
+        data.get("projects", {})
+            .get(ws_key, {})
+            .get("mcpServers", {})
+    )
+
+
+def _mcp_server_exists(name: str) -> bool:
+    if not CLAUDE_JSON.exists():
+        return False
+    try:
+        data = json.loads(CLAUDE_JSON.read_bytes())
+    except (json.JSONDecodeError, OSError):
+        return False
+    servers = _workspace_mcp_servers(data)
+    return isinstance(servers.get(name), dict)
+
+
+def _gdrive_credentials_path() -> Path:
+    return CLAUDE_WORKSPACE / "config" / "google" / "gdrive-credentials.json"
+
+
+def _validate_google_oauth_credentials(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    client = data.get("installed") or data.get("web")
+    if not isinstance(client, dict):
+        return False
+    required = {"client_id", "client_secret", "auth_uri", "token_uri"}
+    return all(bool(client.get(k)) for k in required)
 
 
 def _parse_frontmatter(text: str) -> dict:
@@ -352,6 +419,18 @@ def _remove_env_section(env_path: Path, comment: str) -> list[str]:
 def list_integrations():
     results = []
     for integ in INTEGRATIONS:
+        if integ.get("mcp_server"):
+            configured = _mcp_server_exists(integ["mcp_server"])
+            results.append({
+                "name": integ["name"],
+                "category": integ["category"],
+                "configured": configured,
+                "status": "ok" if configured else "pending",
+                "type": integ["category"],
+                "kind": "core",
+            })
+            continue
+
         keys = integ["keys"]
         if integ.get("prefix"):
             # At least one env var starts with any of the declared prefixes.
@@ -382,6 +461,137 @@ def list_integrations():
         "configured_count": configured_count,
         "total_count": len(all_integrations),
     })
+
+
+@bp.route("/api/integrations/mcp/<name>", methods=["POST"])
+def configure_mcp_integration(name: str):
+    """Register a supported native MCP server for the current workspace."""
+    _require_xhr()
+    spec = MCP_INTEGRATIONS.get(name)
+    if spec is None:
+        return jsonify({"error": f"unsupported MCP integration '{name}'"}), 404
+    if name == "gdrive" and not _gdrive_credentials_path().is_file():
+        return jsonify({
+            "error": "Upload Google Drive OAuth credentials before configuring this MCP",
+            "credentials_path": str(_gdrive_credentials_path()),
+        }), 400
+
+    with _ClaudeJsonWriter() as writer:
+        data = writer.read_claude_json()
+        mcp_servers = _workspace_mcp_servers(data, create=True)
+        if spec.get("type") == "http":
+            entry = {
+                "type": spec["type"],
+                "url": spec["url"],
+            }
+        else:
+            entry = {
+                "command": spec["command"],
+                "args": spec.get("args", []),
+            }
+            if spec.get("env"):
+                entry["env"] = spec["env"]
+        mcp_servers[name] = entry
+        writer.write_atomic(data)
+
+    try:
+        audit(current_user, "configure_mcp_integration", "integrations", f"name={name}")
+    except Exception:
+        log.warning("configure_mcp_integration: audit() failed (non-fatal)", exc_info=True)
+
+    return jsonify({
+        "ok": True,
+        "name": name,
+        "server": entry,
+        "claude_json_path": str(CLAUDE_JSON),
+        "restart_required": True,
+    }), 200
+
+
+@bp.route("/api/integrations/mcp/gdrive/credentials", methods=["POST"])
+def upload_gdrive_credentials():
+    """Upload Google OAuth client credentials used by the gdrive MCP server."""
+    _require_xhr()
+    if "file" not in request.files:
+        return jsonify({"error": "No credentials file uploaded"}), 400
+
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "No credentials file selected"}), 400
+    if not f.filename.lower().endswith(".json"):
+        return jsonify({"error": "Credentials must be a .json file"}), 400
+
+    raw = f.read()
+    if len(raw) > 1024 * 1024:
+        return jsonify({"error": "Credentials file is too large"}), 400
+
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Credentials file is not valid JSON"}), 400
+
+    if not _validate_google_oauth_credentials(parsed):
+        return jsonify({
+            "error": "Credentials JSON must be a Google OAuth client file with installed/web client_id and client_secret"
+        }), 400
+
+    target = _gdrive_credentials_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=target.parent, prefix=".gdrive-credentials.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(parsed, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_path, target)
+        try:
+            target.chmod(0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    try:
+        audit(current_user, "upload_gdrive_credentials", "integrations", f"path={target}")
+    except Exception:
+        log.warning("upload_gdrive_credentials: audit() failed (non-fatal)", exc_info=True)
+
+    return jsonify({
+        "ok": True,
+        "credentials_path": str(target),
+    }), 200
+
+
+@bp.route("/api/integrations/mcp/<name>", methods=["DELETE"])
+def delete_mcp_integration(name: str):
+    """Remove a supported native MCP server from the current workspace."""
+    _require_xhr()
+    if name not in MCP_INTEGRATIONS:
+        return jsonify({"error": f"unsupported MCP integration '{name}'"}), 404
+
+    with _ClaudeJsonWriter() as writer:
+        data = writer.read_claude_json()
+        mcp_servers = _workspace_mcp_servers(data, create=True)
+        existed = name in mcp_servers
+        if existed:
+            del mcp_servers[name]
+            writer.write_atomic(data)
+
+    try:
+        audit(current_user, "delete_mcp_integration", "integrations", f"name={name} existed={existed}")
+    except Exception:
+        log.warning("delete_mcp_integration: audit() failed (non-fatal)", exc_info=True)
+
+    return jsonify({
+        "ok": True,
+        "name": name,
+        "removed": existed,
+        "claude_json_path": str(CLAUDE_JSON),
+        "restart_required": True,
+    }), 200
 
 
 @bp.route("/api/integrations/custom", methods=["POST"])

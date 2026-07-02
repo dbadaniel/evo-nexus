@@ -11,6 +11,20 @@ export interface IntegrationMeta {
   docsUrl?: string
   fields: IntegrationFieldMeta[]
   oauthFlow?: boolean
+  mcpServer?: (
+    | {
+        name: string
+        type: 'http'
+        url: string
+      }
+    | {
+        name: string
+        command: string
+        args: string[]
+        env?: Record<string, string>
+        note?: string
+      }
+  )
 }
 
 const INTEGRATION_META: IntegrationMeta[] = [
@@ -156,13 +170,51 @@ const INTEGRATION_META: IntegrationMeta[] = [
   {
     id: 'google calendar',
     description: 'Criar/ler/atualizar eventos (via MCP)',
-    oauthFlow: true,
+    mcpServer: {
+      name: 'google-calendar',
+      type: 'http',
+      url: 'https://gcal.mcp.claude.com/mcp',
+    },
     fields: [],
   },
   {
     id: 'gmail',
     description: 'Ler, rascunhar e enviar emails (via MCP)',
-    oauthFlow: true,
+    mcpServer: {
+      name: 'gmail',
+      type: 'http',
+      url: 'https://gmail.mcp.claude.com/mcp',
+    },
+    fields: [],
+  },
+  {
+    id: 'google drive',
+    description: 'Buscar, listar e ler arquivos do Google Drive (via MCP)',
+    docsUrl: 'https://github.com/modelcontextprotocol/servers/tree/main/src/gdrive',
+    mcpServer: {
+      name: 'gdrive',
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-gdrive'],
+      env: {
+        GDRIVE_CREDENTIALS_PATH: '/workspace/config/google/gdrive-credentials.json',
+      },
+      note: 'Requer credenciais OAuth do Google Drive no caminho configurado.',
+    },
+    fields: [],
+  },
+  {
+    id: 'google sheets',
+    description: 'Ler planilhas Google Sheets exportadas como CSV pelo Drive MCP',
+    docsUrl: 'https://github.com/modelcontextprotocol/servers/tree/main/src/gdrive',
+    mcpServer: {
+      name: 'gdrive',
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-gdrive'],
+      env: {
+        GDRIVE_CREDENTIALS_PATH: '/workspace/config/google/gdrive-credentials.json',
+      },
+      note: 'Usa o mesmo MCP do Google Drive; Sheets são acessadas/exportadas como CSV.',
+    },
     fields: [],
   },
   {

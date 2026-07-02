@@ -66,6 +66,16 @@ export const api = {
     if (!res.ok) throw await buildError(res);
     return res.json();
   },
+  upload: async (path: string, formData: FormData) => {
+    const res = await fetch(`${API}/api${path}`, {
+      method: 'POST',
+      headers: XHR_HEADER,
+      credentials: 'include',
+      body: formData,
+    });
+    if (!res.ok) throw await buildError(res);
+    return res.json();
+  },
   put: async (path: string, body?: unknown) => {
     const res = await fetch(`${API}/api${path}`, {
       method: 'PUT',

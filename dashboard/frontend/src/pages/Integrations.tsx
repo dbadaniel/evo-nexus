@@ -152,6 +152,8 @@ const INTEGRATION_ICONS: Record<string, { icon: LucideIcon; color: string; color
   'linear':         { icon: BookOpen,      color: '#5E6AD2', colorMuted: 'rgba(94,106,210,0.12)' },
   'google calendar': { icon: Calendar,     color: '#4285F4', colorMuted: 'rgba(66,133,244,0.12)' },
   'gmail':          { icon: Mail,          color: '#EA4335', colorMuted: 'rgba(234,67,53,0.12)' },
+  'google drive':   { icon: Database,      color: '#F4B400', colorMuted: 'rgba(244,180,0,0.12)' },
+  'google sheets':  { icon: Database,      color: '#0F9D58', colorMuted: 'rgba(15,157,88,0.12)' },
   'youtube':        { icon: Video,         color: '#FF0000', colorMuted: 'rgba(255,0,0,0.12)' },
   'instagram':      { icon: Camera,        color: '#E4405F', colorMuted: 'rgba(228,64,95,0.12)' },
   'linkedin':       { icon: Briefcase,     color: '#0A66C2', colorMuted: 'rgba(10,102,194,0.12)' },
@@ -650,7 +652,9 @@ function IntegrationCard({ int, onSelect, onEdit, onDelete }: IntegrationCardPro
   const isConnected = int.status === 'ok'
   const intMeta = int.kind === 'core' ? getIntegrationMeta(int.name) : null
   const isOAuth = intMeta?.oauthFlow === true
+  const isMcp = !!intMeta?.mcpServer
   const isConfigurable = !isOAuth && (
+    isMcp ||
     (intMeta?.fields && intMeta.fields.length > 0) ||
     (int.kind === 'custom' && (int.envKeys?.length ?? 0) > 0)
   )
@@ -764,7 +768,12 @@ function IntegrationCard({ int, onSelect, onEdit, onDelete }: IntegrationCardPro
         </div>
 
         {/* Hover affordance */}
-        {isOAuth ? (
+        {isMcp ? (
+          <span className="flex items-center gap-1 text-[11px] text-[#667085] group-hover:text-[#00FFA7] opacity-0 group-hover:opacity-100 transition-all duration-200">
+            <Plug size={11} />
+            Configurar MCP
+          </span>
+        ) : isOAuth ? (
           <span className="flex items-center gap-1 text-[11px] text-[#667085] group-hover:text-[#00FFA7] opacity-0 group-hover:opacity-100 transition-all duration-200">
             Conectar
           </span>
@@ -975,7 +984,6 @@ export default function Integrations() {
         envValues={envValues}
         onClose={() => setSelectedIntegration(null)}
         onSaved={() => {
-          setSelectedIntegration(null)
           loadData()
         }}
       />
