@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { Upload as UploadIcon, X, CheckCircle, XCircle, RefreshCw } from 'lucide-react'
 import { useAuth } from '../../context/AuthContext'
 import { useKnowledge } from '../../context/KnowledgeContext'
+import { api } from '../../lib/api'
 
 const API = import.meta.env.DEV ? 'http://localhost:8080' : ''
 
@@ -163,16 +164,7 @@ export default function KnowledgeUpload() {
         formData.append('space_id', selectedSpaceId)
         if (selectedUnitId) formData.append('unit_id', selectedUnitId)
 
-        const res = await fetch(
-          `${API}/api/knowledge/connections/${activeConnectionId}/documents`,
-          { method: 'POST', body: formData, credentials: 'include' }
-        )
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}))
-          setPhase(item.id, 'error', { error: err.error || `Upload failed: ${res.statusText}` })
-          continue
-        }
-        const data = await res.json()
+        const data = await api.upload(`/knowledge/connections/${activeConnectionId}/documents`, formData)
         const docId = data.id || data.document_id
         setPhase(item.id, 'parsing', { documentId: docId })
         if (docId) pollStatus(item.id, docId)
