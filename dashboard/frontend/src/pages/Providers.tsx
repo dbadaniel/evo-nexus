@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { CheckCircle2, AlertCircle, RefreshCw, X } from 'lucide-react'
 import { api } from '../lib/api'
 import { useTranslation } from 'react-i18next'
+import { TS_HTTP } from '../lib/terminal-url'
 
 interface ProviderEnvVars { [key: string]: string }
 
@@ -19,6 +20,7 @@ interface ProvidersResponse {
 }
 
 const ENV_VAR_LABELS: Record<string, string> = {
+  ANTHROPIC_API_KEY: 'Anthropic API Key',
   CLAUDE_CODE_USE_OPENAI: 'Use OpenAI (flag)', CLAUDE_CODE_USE_GEMINI: 'Use Gemini (flag)',
   CLAUDE_CODE_USE_BEDROCK: 'Use Bedrock (flag)', CLAUDE_CODE_USE_VERTEX: 'Use Vertex (flag)',
   OPENAI_BASE_URL: 'Base URL', OPENAI_API_KEY: 'API Key', OPENAI_MODEL: 'Model',
@@ -196,6 +198,12 @@ export default function Providers() {
   const [devicePolling, setDevicePolling] = useState(false)
   const [toggling, setToggling] = useState<string | null>(null)
   const [claudeLogoutLoading, setClaudeLogoutLoading] = useState(false)
+  const [claudeAuthModal, setClaudeAuthModal] = useState(false)
+  const [claudeAuthSessionId, setClaudeAuthSessionId] = useState<string | null>(null)
+  const [claudeAuthOutput, setClaudeAuthOutput] = useState('')
+  const [claudeAuthActive, setClaudeAuthActive] = useState(false)
+  const [claudeAuthInput, setClaudeAuthInput] = useState('')
+  const [claudeAuthLoading, setClaudeAuthLoading] = useState(false)
 
   // Dynamic model discovery — populated when Configure modal opens for
   // openai/codex_auth. Shape: { [providerId]: { loading, models[], error? } }
@@ -225,6 +233,23 @@ export default function Providers() {
     const timer = setInterval(pollDeviceAuth, interval)
     return () => clearInterval(timer)
   }, [devicePolling])
+  useEffect(() => {
+    if (!claudeAuthModal || !claudeAuthSessionId) return
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`${TS_HTTP}/api/providers/anthropic/login/${claudeAuthSessionId}`)
+        if (!res.ok) return
+        const data = await res.json()
+        setClaudeAuthOutput(data.output || '')
+        setClaudeAuthActive(Boolean(data.active))
+        if (!data.active) {
+          load()
+          clearInterval(timer)
+        }
+      } catch {}
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [claudeAuthModal, claudeAuthSessionId])
 
   const handleToggle = async (id: string, turnOn: boolean) => {
     setToggling(id)
@@ -350,6 +375,45 @@ export default function Providers() {
   const startDeviceAuth = async () => { setAuthLoading(true); setAuthMessage(null); try { const d = await api.post('/providers/openai/device-start') as any; if (d.error) setAuthMessage({ type: 'error', text: d.error }); else { setDeviceCode(d); setDevicePolling(true) } } catch { setAuthMessage({ type: 'error', text: 'Device auth not available' }) } finally { setAuthLoading(false) } }
   const pollDeviceAuth = async () => { try { const r = await api.post('/providers/openai/device-poll') as any; if (r.status === 'authorized') { setDevicePolling(false); setDeviceCode(null); setAuthModal(false); loadCodexAuth(); load() } } catch {} }
   const handleOpenAILogout = async () => { try { await api.post('/providers/openai/logout'); setCodexAuth({ authenticated: false }); load() } catch {} }
+  const startClaudeLogin = async () => {
+    setClaudeAuthModal(true)
+    setClaudeAuthLoading(true)
+    setClaudeAuthOutput('')
+    setClaudeAuthSessionId(null)
+    setClaudeAuthActive(false)
+    try {
+      const res = await fetch(`${TS_HTTP}/api/providers/anthropic/login/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'claudeai' }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data?.message || data?.error || `HTTP ${res.status}`)
+      setClaudeAuthSessionId(data.authSessionId)
+      setClaudeAuthActive(true)
+    } catch (err: any) {
+      setClaudeAuthOutput(`Failed to start Claude login: ${err?.message || err}`)
+    } finally {
+      setClaudeAuthLoading(false)
+    }
+  }
+  const sendClaudeAuthInput = async (input: string) => {
+    if (!claudeAuthSessionId || !claudeAuthActive) return
+    await fetch(`${TS_HTTP}/api/providers/anthropic/login/${claudeAuthSessionId}/input`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input }),
+    }).catch(() => {})
+  }
+  const closeClaudeAuth = async () => {
+    if (claudeAuthSessionId && claudeAuthActive) {
+      await fetch(`${TS_HTTP}/api/providers/anthropic/login/${claudeAuthSessionId}/stop`, { method: 'POST' }).catch(() => {})
+    }
+    setClaudeAuthModal(false)
+    setClaudeAuthSessionId(null)
+    setClaudeAuthActive(false)
+    load()
+  }
   const handleClaudeLogout = async (providerId: string) => {
     setClaudeLogoutLoading(true)
     try {
@@ -374,6 +438,7 @@ export default function Providers() {
 
   const configuredCount = providers.filter(p => p.has_config && p.installed).length
   const hasActive = activeProvider !== 'none' && providers.some(p => p.id === activeProvider)
+  const claudeAuthUrl = claudeAuthOutput.match(/https?:\/\/[^\s)]+/)?.[0] || ''
 
   const inp = "w-full px-4 py-3 rounded-lg bg-[#0f1520] border border-[#1e2a3a] text-[#e2e8f0] placeholder-[#3d4f65] text-sm transition-colors duration-200 focus:outline-none focus:border-[#00FFA7]/60 focus:ring-1 focus:ring-[#00FFA7]/20 font-mono"
   const lbl = "block text-[11px] font-semibold text-[#5a6b7f] mb-1.5 tracking-[0.08em] uppercase"
@@ -456,6 +521,13 @@ export default function Providers() {
 
                   {/* Actions */}
                   <div className="flex items-center gap-2 shrink-0">
+                    {prov.id === 'anthropic' && isInstalled && (
+                      <button onClick={startClaudeLogin}
+                        className="text-[11px] px-3 py-1.5 rounded-md bg-[#D4A574]/10 text-[#D4A574] border border-[#D4A574]/20 hover:bg-[#D4A574]/20 transition-colors font-medium">
+                        Login Claude
+                      </button>
+                    )}
+
                     {/* Codex OAuth login / logout — only on codex_auth card */}
                     {prov.id === 'codex_auth' && isInstalled && !codexAuth?.authenticated && (
                       <button onClick={() => { setAuthModal(true); setAuthMode('browser'); setAuthUrl(''); setCallbackUrl(''); setAuthMessage(null); setDeviceCode(null); setDevicePolling(false); startBrowserAuth() }}
@@ -659,6 +731,83 @@ export default function Providers() {
           </div>
         )
       })()}
+
+      {/* Claude Native Login Modal */}
+      {claudeAuthModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="w-full max-w-2xl mx-4 rounded-xl border border-[#152030] bg-[#0b1018] shadow-[0_4px_40px_rgba(0,0,0,0.4)]">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#152030]">
+              <div>
+                <h2 className="text-sm font-semibold text-white">Login Claude Code</h2>
+                <p className="text-[11px] text-[#5a6b7f] mt-0.5">Runs <code>claude auth login</code> inside the server container.</p>
+              </div>
+              <button onClick={closeClaudeAuth} className="p-1 rounded text-[#5a6b7f] hover:text-white transition-colors">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="px-6 py-5 space-y-4">
+              {claudeAuthUrl && (
+                <a href={claudeAuthUrl} target="_blank" rel="noopener noreferrer"
+                  className="block text-center py-2 rounded-md bg-[#D4A574]/10 text-[#D4A574] border border-[#D4A574]/20 hover:bg-[#D4A574]/20 transition-colors text-sm font-medium">
+                  Open Claude Login
+                </a>
+              )}
+
+              <pre className="min-h-[260px] max-h-[360px] overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-[#1e2a3a] bg-[#05070b] p-4 text-xs leading-relaxed text-[#d0d7de] font-mono">
+                {claudeAuthLoading ? 'Starting Claude login...' : (claudeAuthOutput || 'Waiting for Claude Code output...')}
+              </pre>
+
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={claudeAuthInput}
+                  onChange={(e) => setClaudeAuthInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      sendClaudeAuthInput(`${claudeAuthInput}\r`)
+                      setClaudeAuthInput('')
+                    }
+                  }}
+                  disabled={!claudeAuthActive}
+                  placeholder="Type here if Claude asks for input"
+                  className={inp}
+                />
+                <button
+                  onClick={() => { sendClaudeAuthInput(`${claudeAuthInput}\r`); setClaudeAuthInput('') }}
+                  disabled={!claudeAuthActive}
+                  className="text-[11px] px-4 py-3 rounded-md text-[#D4A574] border border-[#D4A574]/20 hover:bg-[#D4A574]/10 transition-colors disabled:opacity-40"
+                >
+                  Send
+                </button>
+                <button
+                  onClick={() => sendClaudeAuthInput('\r')}
+                  disabled={!claudeAuthActive}
+                  className="text-[11px] px-4 py-3 rounded-md text-[#5a6b7f] border border-[#1e2a3a] hover:text-[#8a9aae] transition-colors disabled:opacity-40"
+                >
+                  Enter
+                </button>
+              </div>
+
+              {!claudeAuthActive && claudeAuthSessionId && (
+                <div className="rounded-lg bg-[#00FFA7]/5 p-3 text-xs text-[#00FFA7]">
+                  Claude login process finished. Use Test to confirm authentication.
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between px-6 py-4 border-t border-[#152030]">
+              <span className="text-[11px] text-[#5a6b7f]">
+                {claudeAuthActive ? 'Login process is running' : 'Login process is not running'}
+              </span>
+              <button onClick={closeClaudeAuth}
+                className="text-[11px] px-4 py-1.5 rounded-md text-[#5a6b7f] border border-[#1e2a3a] hover:text-[#8a9aae] transition-colors">
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* OpenAI Auth Modal */}
       {authModal && (

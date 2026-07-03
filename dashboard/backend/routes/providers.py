@@ -45,6 +45,7 @@ ALLOWED_CLI_COMMANDS = frozenset({"claude", "openclaude"})
 
 # Allowlisted env var names — only these can be injected into subprocess
 ALLOWED_ENV_VARS = frozenset({
+    "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_USE_OPENAI",
     "CLAUDE_CODE_USE_GEMINI",
     "CLAUDE_CODE_USE_BEDROCK",
@@ -74,7 +75,12 @@ def _read_config() -> dict:
                 import shutil as _shutil
                 _shutil.copy2(example, PROVIDERS_CONFIG)
         if PROVIDERS_CONFIG.is_file():
-            return json.loads(PROVIDERS_CONFIG.read_text(encoding="utf-8"))
+            config = json.loads(PROVIDERS_CONFIG.read_text(encoding="utf-8"))
+            providers = config.setdefault("providers", {})
+            anthropic = providers.get("anthropic")
+            if isinstance(anthropic, dict):
+                anthropic.setdefault("env_vars", {}).setdefault("ANTHROPIC_API_KEY", "")
+            return config
     except (json.JSONDecodeError, OSError):
         pass
     return {"active_provider": "anthropic", "providers": {}}

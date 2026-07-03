@@ -180,6 +180,16 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
             }
             // Restore ticket binding (Feature 1.3)
             setTicketId(msg.ticketId || null)
+            if (Array.isArray(msg.pendingApprovals)) {
+              setPendingApprovals(msg.pendingApprovals.map((req: any) => ({
+                requestId: req.requestId,
+                toolName: req.toolName,
+                input: req.input || {},
+                title: req.title || null,
+                description: req.description || null,
+                createdAt: req.createdAt || Date.now(),
+              })))
+            }
             break
 
           case 'chat_history':
@@ -202,14 +212,21 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
 
           case 'permission_request':
             if (msg.requestId) {
-              setPendingApprovals(prev => [...prev, {
-                requestId: msg.requestId,
-                toolName: msg.toolName,
-                input: msg.input || {},
-                title: msg.title || null,
-                description: msg.description || null,
-                createdAt: Date.now(),
-              }])
+              setPendingApprovals(prev => {
+                const nextReq = {
+                  requestId: msg.requestId,
+                  toolName: msg.toolName,
+                  input: msg.input || {},
+                  title: msg.title || null,
+                  description: msg.description || null,
+                  createdAt: Date.now(),
+                }
+                const existing = prev.findIndex(req => req.requestId === msg.requestId)
+                if (existing === -1) return [...prev, nextReq]
+                const copy = [...prev]
+                copy[existing] = nextReq
+                return copy
+              })
               // Request OS notification permission silently on first request
               if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
                 Notification.requestPermission().catch(() => {})

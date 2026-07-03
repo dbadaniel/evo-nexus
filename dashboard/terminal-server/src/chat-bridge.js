@@ -519,6 +519,7 @@ class ChatBridge {
     } else {
       const claudeExe = resolveClaudeExecutable();
       if (claudeExe) queryOptions.pathToClaudeCodeExecutable = claudeExe;
+      queryOptions.env = providerConfig.env_vars || {};
     }
 
     // Load agent definition from .claude/agents/{name}.md
@@ -587,7 +588,13 @@ class ChatBridge {
       }
       return new Promise((resolve) => {
         if (!currentSession.pendingApprovals) currentSession.pendingApprovals = new Map();
-        currentSession.pendingApprovals.set(requestId, { resolve, toolInput: input });
+        currentSession.pendingApprovals.set(requestId, {
+          resolve,
+          toolInput: input,
+          toolName,
+          agentId: agentId || null,
+          createdAt: Date.now(),
+        });
         if (onMessage) {
           onMessage({
             type: 'permission_request',

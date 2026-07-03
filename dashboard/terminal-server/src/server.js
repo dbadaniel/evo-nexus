@@ -5,6 +5,7 @@ const fs = require('fs');
 const WebSocket = require('ws');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const { spawn: ptySpawn } = require('node-pty');
 const ClaudeBridge = require('./claude-bridge');
 const { ChatBridge } = require('./chat-bridge');
 const SessionStore = require('./utils/session-store');
@@ -32,6 +33,7 @@ class TerminalServer {
     this.globalSubscribers = new Set(); // wsIds subscribed to global notifications
     this.claudeBridge = new ClaudeBridge();
     this.chatBridge = new ChatBridge();
+    this.authSessions = new Map();
     this.sessionStore = new SessionStore({ sessionTtlMs: this.sessionTtlMs });
     this.chatLogger = new ChatLogger(this.baseFolder);
     this.autoSaveInterval = null;
@@ -622,18 +624,117 @@ class TerminalServer {
       for (const [sessionId, session] of this.claudeSessions.entries()) {
         const bridgeSession = this.chatBridge.sessions.get(sessionId);
         if (!bridgeSession?.pendingApprovals) continue;
-        for (const [requestId] of bridgeSession.pendingApprovals.entries()) {
+        for (const [requestId, approval] of bridgeSession.pendingApprovals.entries()) {
+          const inputPreview = approval.toolInput
+            ? (typeof approval.toolInput === 'string' ? approval.toolInput : JSON.stringify(approval.toolInput)).slice(0, 80)
+            : undefined;
           notifications.push({
             id: `agent_awaiting-${sessionId}-${requestId}`,
             event: 'agent_awaiting',
             sessionId,
             agentName: session.agentName || '',
-            toolName: undefined,
-            createdAt: Date.now(),
+            toolName: approval.toolName,
+            inputPreview,
+            createdAt: approval.createdAt || Date.now(),
           });
         }
       }
       res.json({ notifications });
+    });
+
+    this.app.post('/api/providers/anthropic/login/start', (req, res) => {
+      const mode = req.body?.mode === 'console' ? 'console' : 'claudeai';
+      const forceSso = Boolean(req.body?.sso);
+      const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+      const args = ['auth', 'login', mode === 'console' ? '--console' : '--claudeai'];
+      if (forceSso) args.push('--sso');
+      if (email && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+        args.push('--email', email);
+      }
+
+      const authSessionId = uuidv4();
+      try {
+        const proc = ptySpawn('claude', args, {
+          cwd: this.baseFolder,
+          env: {
+            ...process.env,
+            TERM: 'xterm-256color',
+            FORCE_COLOR: '1',
+            COLORTERM: 'truecolor',
+          },
+          cols: 100,
+          rows: 28,
+          name: 'xterm-color',
+        });
+
+        const authSession = {
+          id: authSessionId,
+          process: proc,
+          output: '',
+          active: true,
+          createdAt: Date.now(),
+          exitCode: null,
+          signal: null,
+        };
+        this.authSessions.set(authSessionId, authSession);
+
+        proc.onData((chunk) => {
+          authSession.output += chunk;
+          if (authSession.output.length > 30000) {
+            authSession.output = authSession.output.slice(-30000);
+          }
+        });
+
+        proc.onExit(({ exitCode, signal }) => {
+          authSession.active = false;
+          authSession.exitCode = exitCode;
+          authSession.signal = signal;
+        });
+
+        res.json({ authSessionId, active: true });
+      } catch (error) {
+        res.status(500).json({
+          error: 'Failed to start Claude login',
+          message: error.message,
+        });
+      }
+    });
+
+    this.app.get('/api/providers/anthropic/login/:authSessionId', (req, res) => {
+      const authSession = this.authSessions.get(req.params.authSessionId);
+      if (!authSession) return res.status(404).json({ error: 'Auth session not found' });
+      res.json({
+        authSessionId: authSession.id,
+        output: authSession.output,
+        active: authSession.active,
+        exitCode: authSession.exitCode,
+        signal: authSession.signal,
+      });
+    });
+
+    this.app.post('/api/providers/anthropic/login/:authSessionId/input', (req, res) => {
+      const authSession = this.authSessions.get(req.params.authSessionId);
+      if (!authSession || !authSession.active) {
+        return res.status(404).json({ error: 'Auth session not active' });
+      }
+      const input = typeof req.body?.input === 'string' ? req.body.input : '';
+      try {
+        authSession.process.write(input);
+        res.json({ ok: true });
+      } catch (error) {
+        res.status(500).json({ error: 'Failed to write input', message: error.message });
+      }
+    });
+
+    this.app.post('/api/providers/anthropic/login/:authSessionId/stop', (req, res) => {
+      const authSession = this.authSessions.get(req.params.authSessionId);
+      if (!authSession) return res.json({ ok: true });
+      try {
+        if (authSession.active) authSession.process.kill('SIGTERM');
+      } catch {}
+      authSession.active = false;
+      this.authSessions.delete(req.params.authSessionId);
+      res.json({ ok: true });
     });
 
     // Chat mode is handled via WebSocket (chat_send / chat_stop messages)
@@ -1028,6 +1129,22 @@ class TerminalServer {
       }
     }
 
+    const pendingApprovals = [];
+    const bridgeSession = this.chatBridge.sessions.get(claudeSessionId);
+    if (bridgeSession?.pendingApprovals) {
+      for (const [requestId, approval] of bridgeSession.pendingApprovals.entries()) {
+        pendingApprovals.push({
+          requestId,
+          toolName: approval.toolName,
+          input: approval.toolInput || {},
+          title: approval.title || null,
+          description: approval.description || null,
+          agentId: approval.agentId || null,
+          createdAt: approval.createdAt || Date.now(),
+        });
+      }
+    }
+
     this.sendToWebSocket(wsInfo.ws, {
       type: 'session_joined',
       sessionId: claudeSessionId,
@@ -1036,6 +1153,7 @@ class TerminalServer {
       active: session.active,
       outputBuffer: session.outputBuffer.slice(-200),
       chatHistory,
+      pendingApprovals,
       ticketId: session.ticketId || null,
     });
 
@@ -1201,8 +1319,14 @@ class TerminalServer {
     for (const [sessionId, session] of this.claudeSessions.entries()) {
       if (session.active) this.claudeBridge.stopSession(sessionId);
     }
+    for (const authSession of this.authSessions.values()) {
+      try {
+        if (authSession.active) authSession.process.kill('SIGTERM');
+      } catch {}
+    }
 
     this.claudeSessions.clear();
+    this.authSessions.clear();
     this.webSocketConnections.clear();
   }
 }
