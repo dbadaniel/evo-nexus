@@ -30,6 +30,15 @@ OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 OPENAI_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
+CLAUDE_CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")).expanduser()
+CLAUDE_AUTH_FILES = (
+    ".credentials.json",
+    "credentials.json",
+    "auth.json",
+    ".auth.json",
+    "oauth.json",
+    ".oauth.json",
+)
 
 # Allowlisted CLI commands — only these binaries can be spawned
 ALLOWED_CLI_COMMANDS = frozenset({"claude", "openclaude"})
@@ -688,3 +697,49 @@ def openai_logout():
     config["active_provider"] = "anthropic"
     _write_config(config)
     return jsonify({"status": "ok"})
+
+
+@bp.route("/api/providers/anthropic/logout", methods=["POST"])
+@login_required
+def anthropic_logout():
+    """Remove native Claude Code auth files without deleting workspace settings."""
+    removed = []
+    skipped = []
+
+    for filename in CLAUDE_AUTH_FILES:
+        path = CLAUDE_CONFIG_DIR / filename
+        try:
+            if path.is_file():
+                path.unlink()
+                removed.append(str(path))
+        except OSError as exc:
+            skipped.append({"path": str(path), "error": str(exc)})
+
+    # Some Claude Code builds store OAuth material under a credentials
+    # subdirectory. Remove only files with auth-like names, never settings.
+    credentials_dir = CLAUDE_CONFIG_DIR / "credentials"
+    try:
+        if credentials_dir.is_dir():
+            for path in credentials_dir.iterdir():
+                if not path.is_file():
+                    continue
+                name = path.name.lower()
+                if not any(marker in name for marker in ("credential", "auth", "oauth", "token")):
+                    continue
+                try:
+                    path.unlink()
+                    removed.append(str(path))
+                except OSError as exc:
+                    skipped.append({"path": str(path), "error": str(exc)})
+    except OSError as exc:
+        skipped.append({"path": str(credentials_dir), "error": str(exc)})
+
+    return jsonify({
+        "status": "ok" if not skipped else "partial",
+        "removed": removed,
+        "skipped": skipped,
+        "message": (
+            "Claude Code auth removed"
+            if removed else "No Claude Code auth files were found"
+        ),
+    })

@@ -195,6 +195,7 @@ export default function Providers() {
   const [deviceCode, setDeviceCode] = useState<{ user_code: string; verification_url: string; interval: number; expires_in: number } | null>(null)
   const [devicePolling, setDevicePolling] = useState(false)
   const [toggling, setToggling] = useState<string | null>(null)
+  const [claudeLogoutLoading, setClaudeLogoutLoading] = useState(false)
 
   // Dynamic model discovery — populated when Configure modal opens for
   // openai/codex_auth. Shape: { [providerId]: { loading, models[], error? } }
@@ -349,6 +350,27 @@ export default function Providers() {
   const startDeviceAuth = async () => { setAuthLoading(true); setAuthMessage(null); try { const d = await api.post('/providers/openai/device-start') as any; if (d.error) setAuthMessage({ type: 'error', text: d.error }); else { setDeviceCode(d); setDevicePolling(true) } } catch { setAuthMessage({ type: 'error', text: 'Device auth not available' }) } finally { setAuthLoading(false) } }
   const pollDeviceAuth = async () => { try { const r = await api.post('/providers/openai/device-poll') as any; if (r.status === 'authorized') { setDevicePolling(false); setDeviceCode(null); setAuthModal(false); loadCodexAuth(); load() } } catch {} }
   const handleOpenAILogout = async () => { try { await api.post('/providers/openai/logout'); setCodexAuth({ authenticated: false }); load() } catch {} }
+  const handleClaudeLogout = async (providerId: string) => {
+    setClaudeLogoutLoading(true)
+    try {
+      const result = await api.post('/providers/anthropic/logout') as any
+      setTestResults(prev => ({
+        ...prev,
+        [providerId]: {
+          success: result.status !== 'partial',
+          message: result.message || 'Claude Code logout completed',
+        },
+      }))
+      load()
+    } catch {
+      setTestResults(prev => ({
+        ...prev,
+        [providerId]: { success: false, message: 'Claude Code logout failed' },
+      }))
+    } finally {
+      setClaudeLogoutLoading(false)
+    }
+  }
 
   const configuredCount = providers.filter(p => p.has_config && p.installed).length
   const hasActive = activeProvider !== 'none' && providers.some(p => p.id === activeProvider)
@@ -480,8 +502,16 @@ export default function Providers() {
 
                 {/* Logout warning */}
                 {prov.requires_logout && isActive && (
-                  <div className="mx-5 mb-3 px-3 py-1.5 rounded bg-[#1a1500] text-[10px] text-[#FBBF24]">
-                    Run /logout in Claude Code if you were previously logged into Anthropic
+                  <div className="mx-5 mb-3 px-3 py-2 rounded bg-[#1a1500] text-[10px] text-[#FBBF24] flex items-center justify-between gap-3">
+                    <span>Run /logout in Claude Code if you were previously logged into Anthropic</span>
+                    <button
+                      type="button"
+                      onClick={() => handleClaudeLogout(prov.id)}
+                      disabled={claudeLogoutLoading}
+                      className="shrink-0 rounded border border-[#FBBF24]/20 px-2 py-1 text-[#FBBF24] hover:bg-[#FBBF24]/10 disabled:opacity-50 transition-colors"
+                    >
+                      {claudeLogoutLoading ? 'Logging out...' : 'Logout Claude'}
+                    </button>
                   </div>
                 )}
               </div>
