@@ -9,6 +9,7 @@ const os = require('os');
 const {
   loadProviderConfig,
   resolveProviderModel,
+  getProviderMode,
 } = require('./provider-config');
 let sdkModule = null;
 
@@ -155,6 +156,87 @@ function resolveClaudeExecutable() {
   console.warn('[chat-bridge] Could not resolve Claude binary; letting SDK auto-discover');
   _claudeExecutablePath = null;
   return _claudeExecutablePath;
+}
+
+function resolveCliExecutable(cliCommand = 'claude') {
+  const { execFileSync } = require('child_process');
+  const command = cliCommand === 'openclaude' ? 'openclaude' : 'claude';
+  const lookup = process.platform === 'win32' ? 'where.exe' : 'which';
+
+  try {
+    const resolved = execFileSync(lookup, [command], {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'ignore'],
+    }).split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    if (resolved) {
+      console.log(`[chat-bridge] Found ${command} at: ${resolved}`);
+      return resolved;
+    }
+  } catch {
+    // Fall through to common install paths.
+  }
+
+  const home = process.env.HOME || process.env.USERPROFILE || '/';
+  const candidates = command === 'openclaude'
+    ? [
+        path.join(home, '.local', 'bin', process.platform === 'win32' ? 'openclaude.cmd' : 'openclaude'),
+        path.join(home, '.local', 'bin', 'openclaude'),
+        '/usr/local/bin/openclaude',
+        '/usr/bin/openclaude',
+      ]
+    : [
+        path.join(home, '.claude', 'local', process.platform === 'win32' ? 'claude.cmd' : 'claude'),
+        path.join(home, '.claude', 'local', 'claude'),
+        path.join(home, '.local', 'bin', process.platform === 'win32' ? 'claude.cmd' : 'claude'),
+        path.join(home, '.local', 'bin', 'claude'),
+        '/usr/local/bin/claude',
+        '/usr/bin/claude',
+      ];
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        console.log(`[chat-bridge] Found ${command} at fallback path: ${candidate}`);
+        return candidate;
+      }
+    } catch {}
+  }
+
+  console.warn(`[chat-bridge] ${command} not found on PATH; using bare command name`);
+  return command;
+}
+
+function buildProviderSdkEnv(providerConfig) {
+  const env = { ...(providerConfig.env_vars || {}) };
+  const active = providerConfig.active || 'anthropic';
+
+  if (!env.OPENAI_MODEL) {
+    if (active === 'codex_auth') env.OPENAI_MODEL = 'codexplan';
+    else if (active === 'openai') env.OPENAI_MODEL = 'gpt-4.1';
+  }
+
+  // The SDK merges with process.env. Clear stale credentials that would make
+  // OpenClaude bypass Codex OAuth and try plain Chat Completions instead.
+  const clearIfUnset = [
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'CODEX_API_KEY',
+    'OPENAI_BASE_URL',
+    'GEMINI_API_KEY',
+    'GEMINI_MODEL',
+  ];
+  for (const key of clearIfUnset) {
+    if (!Object.prototype.hasOwnProperty.call(env, key)) {
+      env[key] = undefined;
+    }
+  }
+
+  if (active === 'codex_auth') {
+    env.OPENAI_API_KEY = undefined;
+    env.CODEX_API_KEY = undefined;
+  }
+
+  return env;
 }
 
 /**
@@ -408,7 +490,9 @@ class ChatBridge {
     } = options;
 
     const providerConfig = loadProviderConfig();
-    if (providerConfig.active !== 'anthropic') {
+    const providerMode = getProviderMode(providerConfig);
+    const useProviderCli = providerConfig.active !== 'anthropic' && providerMode === 'code';
+    if (providerConfig.active !== 'anthropic' && !useProviderCli) {
       return this._startOpenAICompatibleSession(sessionId, options, providerConfig);
     }
 
@@ -426,8 +510,16 @@ class ChatBridge {
       abortController,
     };
 
-    const claudeExe = resolveClaudeExecutable();
-    if (claudeExe) queryOptions.pathToClaudeCodeExecutable = claudeExe;
+    if (useProviderCli) {
+      queryOptions.pathToClaudeCodeExecutable = resolveCliExecutable(providerConfig.cli_command);
+      queryOptions.env = buildProviderSdkEnv(providerConfig);
+      console.log(
+        `[chat-bridge] Provider "${providerConfig.active}" is in code mode; using ${providerConfig.cli_command} for dashboard Chat`
+      );
+    } else {
+      const claudeExe = resolveClaudeExecutable();
+      if (claudeExe) queryOptions.pathToClaudeCodeExecutable = claudeExe;
+    }
 
     // Load agent definition from .claude/agents/{name}.md
     if (agentName) {
@@ -463,7 +555,7 @@ class ChatBridge {
           preset: 'claude_code',
           append: promptAppend,
         };
-        if (agentDef.model) queryOptions.model = agentDef.model;
+        if (!useProviderCli && agentDef.model) queryOptions.model = agentDef.model;
         console.log(`[chat-bridge] Loaded agent "${agentName}" via systemPrompt.append (${agentDef.prompt.length} chars, model: ${agentDef.model || 'inherit'})`);
       } else {
         console.warn(`[chat-bridge] Agent "${agentName}" not found, running without agent`);
