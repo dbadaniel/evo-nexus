@@ -35,7 +35,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /terminal
 COPY dashboard/terminal-server/package.json dashboard/terminal-server/package-lock.json* ./
-RUN npm install --omit=dev --no-audit --no-fund
+RUN npm install --omit=dev --no-audit --no-fund \
+    && node -e "const fs=require('fs'),path='node_modules/@anthropic-ai'; const arch=process.arch==='x64'?'x64':process.arch==='arm64'?'arm64':process.arch; for (const name of fs.readdirSync(path)) { if (name.startsWith('claude-agent-sdk-') && name !== 'claude-agent-sdk-linux-'+arch) fs.rmSync(path+'/'+name,{recursive:true,force:true}); }" \
+    && npm cache clean --force
 
 # ---- Stage 3: Python + Node runtime --------------------------------------
 FROM python:3.12-slim AS runtime
@@ -58,7 +60,8 @@ ENV PATH="/root/.local/bin:${PATH}"
 # current fix is ≥0.3.0 (first version with the Codex shortcut endpoint).
 RUN npm install -g \
         @anthropic-ai/claude-code \
-        @gitlawb/openclaude@latest
+        @gitlawb/openclaude@latest \
+    && npm cache clean --force
 
 # Timezone
 ENV TZ=America/Sao_Paulo
@@ -67,8 +70,12 @@ RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/time
 WORKDIR /workspace
 
 # Python deps (cached layer — only rebuilt when pyproject.toml or uv.lock change)
+# --extra knowledge/memory pull in the Knowledge Base's local ML stack
+# (torch/sentence-transformers/marker-pdf) and mempalace's vector store
+# (chromadb/onnxruntime) — needed here because this image runs the Flask
+# app. The runtime images (Dockerfile.swarm, Dockerfile) skip both extras.
 COPY pyproject.toml uv.lock ./
-RUN uv venv .venv && uv sync --no-dev
+RUN uv venv .venv && uv sync --no-dev --extra knowledge --extra memory && uv cache clean
 
 # Application code
 COPY dashboard/       dashboard/

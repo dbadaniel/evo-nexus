@@ -27,13 +27,15 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
 # Install Claude Code CLI (default provider)
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force
 
 # Install OpenClaude CLI — pinned to @latest which is ≥0.3.0 (the first
 # release with the Codex shortcut endpoint fix that resolves the
 # api.responses.write scope issue). Upstream setup.py also installs @latest
 # so Swarm and VPS behavior stay aligned.
-RUN npm install -g @gitlawb/openclaude@latest
+RUN npm install -g @gitlawb/openclaude@latest \
+    && npm cache clean --force
 
 # GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -44,7 +46,8 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # Todoist CLI (used by int-todoist skill)
-RUN npm install -g todoist-ts-cli
+RUN npm install -g todoist-ts-cli \
+    && npm cache clean --force
 
 # Timezone (default America/Sao_Paulo, override via TZ env var)
 ENV TZ=America/Sao_Paulo
@@ -54,7 +57,7 @@ WORKDIR /workspace
 
 # Python deps (cache-friendly layer)
 COPY pyproject.toml uv.lock ./
-RUN uv venv .venv && uv sync
+RUN uv venv .venv && uv sync --no-dev && uv cache clean
 
 # Application code — everything else
 COPY . .

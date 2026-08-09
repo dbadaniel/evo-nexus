@@ -22,17 +22,34 @@ dependencies = [
     "psycopg2-binary",
     "alembic>=1.13",
     "tiktoken>=0.7",
-    "torch>=2.11.0",
-    "sentence-transformers>=3.0",
     "openai>=1.0",
     "google-genai>=0.3",
     "anthropic>=0.25",
-    "marker-pdf>=1.6.1",
     "watchdog>=4.0",
     "sqlparse>=0.4,<1.0",
     "jsonschema>=4.21",
     "flask-limiter>=3.5",
     "websocket-client>=1.7",
+]
+
+[project.optional-dependencies]
+# Local ML stack for the Knowledge Base: on-device PDF/DOCX/PPTX parsing
+# (marker-pdf) and local embeddings (sentence-transformers). Only the
+# dashboard (Flask backend, dashboard/backend/knowledge/) uses these —
+# the agent runtime images never import that module. Without this extra,
+# the Knowledge Base falls back to remote providers (LlamaParse /
+# OpenAI / Gemini embeddings) configured via env vars; plain text/markdown
+# ingestion is unaffected either way.
+knowledge = [
+    "torch>=2.11.0",
+    "sentence-transformers>=3.0",
+    "marker-pdf>=1.6.1",
+]
+# Long-term agent memory (vector store via chromadb + onnxruntime). Only
+# dashboard/backend/routes/mempalace.py imports this — the agent runtime
+# talks to it over the dashboard's HTTP API (EvoClient SDK) instead of
+# importing the package directly.
+memory = [
     "mempalace>=0.1",
 ]
 
@@ -45,6 +62,8 @@ dev-dependencies = [
 ]
 
 [tool.uv.sources]
+# Keep Docker/VPS builds on CPU-only PyTorch wheels. Without this, Linux
+# resolution can pull CUDA/NVIDIA wheels and inflate the runtime image.
 torch = [
     { index = "pytorch-cpu" },
 ]

@@ -33,8 +33,11 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 WORKDIR /workspace
 
 # Install Python deps
+# --extra knowledge/memory: this image runs the Flask app, which needs the
+# Knowledge Base's local ML stack and mempalace's vector store. The runtime
+# image (Dockerfile) skips both extras.
 COPY pyproject.toml uv.lock ./
-RUN uv venv .venv && uv sync --no-dev
+RUN uv venv .venv && uv sync --no-dev --extra knowledge --extra memory && uv cache clean
 
 # Copy backend code
 COPY dashboard/backend/ dashboard/backend/

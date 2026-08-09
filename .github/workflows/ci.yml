@@ -43,7 +43,7 @@ jobs:
         run: uv sync --frozen --dev
 
       - name: Run backend tests
-        run: uv run python -m pytest tests/backend/test_auth_security.py tests/backend/test_health_routes.py
+        run: uv run python -m pytest tests/backend/test_dependency_lock.py tests/backend/test_auth_security.py tests/backend/test_health_routes.py
 
   terminal-server:
     runs-on: ubuntu-latest

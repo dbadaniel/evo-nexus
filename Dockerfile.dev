@@ -45,9 +45,9 @@ RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/time
 
 WORKDIR /workspace
 
-# Python deps
+# Python deps (Flask app needs Knowledge Base + mempalace extras)
 COPY pyproject.toml uv.lock ./
-RUN uv venv .venv && uv sync --no-dev
+RUN uv venv .venv && uv sync --no-dev --extra knowledge --extra memory
 
 # App code
 COPY dashboard/       dashboard/
