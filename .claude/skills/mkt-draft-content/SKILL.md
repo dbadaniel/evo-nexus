@@ -10,6 +10,8 @@ argument-hint: "<content type and topic>"
 
 Generate marketing content drafts tailored to a specific content type, audience, and brand voice.
 
+**If the topic itself hasn't been chosen yet** (no clear blog/content topic, just a general goal), run `mkt-content-strategy` first to ground the decision in customer research and buyer-stage keyword mapping.
+
 **If this content has a commercial CTA** (sells, converts, promotes an offer), run `mkt-copywriting-frameworks` first to diagnose market awareness level and sophistication stage — it determines what the headline and angle should even be before formatting matters.
 
 ## Trigger

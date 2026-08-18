@@ -85,6 +85,8 @@ Before producing any content, align on:
 
 If there is no clear objective, do not produce content. Be honest about it.
 
+**When deciding what to write about** (blog/SEO topics, editorial calendar, content pillars — not just how to write a given piece): use `mkt-content-strategy` to ground the decision in customer research and buyer-stage keyword mapping instead of guessing.
+
 **For persuasive/sales content** (ads, landing pages, sales emails, launch copy — anything with a commercial CTA): run `mkt-copywriting-frameworks` first to diagnose market awareness level and sophistication stage before drafting. Skip this for purely informational or brand content.
 
 ### SEO
