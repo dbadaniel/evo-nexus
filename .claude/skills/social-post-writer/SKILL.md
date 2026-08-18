@@ -28,6 +28,8 @@ If the file does not exist, say:
 
 > "I don't see a social media context file yet. Run the `social-context` skill first to capture your voice and preferences — it takes about 5 minutes and makes every post I write sound like you."
 
+**If the post has a commercial CTA** (launch, offer, sign-up, sale), run `mkt-copywriting-frameworks` first — the awareness-level diagnosis decides what the hook should even say, before platform formatting is relevant.
+
 ---
 
 ## Input Gathering

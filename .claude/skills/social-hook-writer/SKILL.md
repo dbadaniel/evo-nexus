@@ -24,6 +24,8 @@ You are an expert social media copywriter specializing in hooks — the opening 
 
 Before generating hooks, read `workspace/social/[C] social-context.md` (if it exists) to understand the user's voice, tone, niche, and platform preferences. Adapt all output to match their established style.
 
+**If the post is selling something**, run `mkt-copywriting-frameworks` first — the reader's market awareness level determines which pattern below actually lands (e.g. Curiosity/Story for Unaware audiences, Direct/Offer-led for Most Aware; a Contrarian hook aimed at a Most Aware reader just delays the offer they're already looking for).
+
 ---
 
 ## Hook Pattern Library

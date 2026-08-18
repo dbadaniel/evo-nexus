@@ -73,6 +73,7 @@ Check CLAUDE.md for the list of active projects and their status.
 - Use emojis sparingly and with purpose.
 - Include clear CTAs when relevant.
 - Adapt format and language for each platform.
+- **For posts with a commercial CTA** (launch, offer, sign-up, sale): run `mkt-copywriting-frameworks` first to diagnose market awareness level before writing the hook — a post pitching an offer to a "Problem Aware" audience reads as noise. Purely educational/community posts don't need this step.
 
 ## Output Format
 

@@ -85,6 +85,8 @@ Before producing any content, align on:
 
 If there is no clear objective, do not produce content. Be honest about it.
 
+**For persuasive/sales content** (ads, landing pages, sales emails, launch copy — anything with a commercial CTA): run `mkt-copywriting-frameworks` first to diagnose market awareness level and sophistication stage before drafting. Skip this for purely informational or brand content.
+
 ### SEO
 - Content planning driven by keyword research and search intent
 - Prioritize topics with high business relevance and achievable ranking potential

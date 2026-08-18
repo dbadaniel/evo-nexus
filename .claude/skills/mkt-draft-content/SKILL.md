@@ -10,6 +10,8 @@ argument-hint: "<content type and topic>"
 
 Generate marketing content drafts tailored to a specific content type, audience, and brand voice.
 
+**If this content has a commercial CTA** (sells, converts, promotes an offer), run `mkt-copywriting-frameworks` first to diagnose market awareness level and sophistication stage — it determines what the headline and angle should even be before formatting matters.
+
 ## Trigger
 
 User runs `/draft-content` or asks to draft, write, or create marketing content.
