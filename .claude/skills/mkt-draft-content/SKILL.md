@@ -76,7 +76,7 @@ Gather the following from the user. If not provided, ask before proceeding:
 - Unsubscribe note reminder
 
 ### Landing Page Copy
-- Headline and subheadline
+- Headline and subheadline — see `references/copy-frameworks.md` for headline formulas by angle (outcome/problem/audience/differentiation/proof-focused) and full page-structure templates (compact, enterprise/B2B, product launch, etc.)
 - Hero section copy
 - Value propositions (3-4 benefit-driven bullets or sections)
 - Social proof placeholder (suggest testimonial or stat placement)
