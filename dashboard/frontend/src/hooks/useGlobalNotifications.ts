@@ -104,7 +104,12 @@ export function useGlobalNotifications() {
     // opening the WS.
     const schedule = (delay: number) => {
       if (!mountedRef.current) return
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
       reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = null
         if (mountedRef.current) connect()
       }, delay)
     }

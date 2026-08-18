@@ -104,6 +104,8 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const pingRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const reconnectDelayRef = useRef(1000)
   const dragCounterRef = useRef(0)
   const subagentToolRef = useRef<{ toolName: string; toolUseId: string; input: string; parentToolUseId: string } | null>(null)
 
@@ -139,7 +141,34 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
     let cancelled = false
     let ws: WebSocket | null = null
 
-    ;(async () => {
+    const clearPing = () => {
+      if (pingRef.current) {
+        clearInterval(pingRef.current)
+        pingRef.current = null
+      }
+    }
+
+    const clearReconnect = () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+    }
+
+    const scheduleReconnect = () => {
+      if (cancelled || reconnectTimerRef.current) return
+      const delay = reconnectDelayRef.current
+      reconnectDelayRef.current = Math.min(delay * 2, 10000)
+      setStatus('connecting')
+      setErrorMsg(null)
+      setIsThinking(false)
+      reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = null
+        connectOnce()
+      }, delay)
+    }
+
+    const connectOnce = async () => {
       // 1) HTTP preflight — fails fast on ECONNREFUSED so we can show a real error
       //    instead of hanging in 'connecting' forever (same pattern as AgentTerminal).
       try {
@@ -147,8 +176,7 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
       } catch {
         if (cancelled) return
-        setStatus('error')
-        setErrorMsg(`Could not reach terminal-server at ${TS_HTTP}. Is it running?`)
+        scheduleReconnect()
         return
       }
       if (cancelled) return
@@ -158,8 +186,8 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
       wsRef.current = ws
 
       ws.onopen = () => {
+        reconnectDelayRef.current = 1000
         ws!.send(JSON.stringify({ type: 'join_session', sessionId }))
-        setStatus('idle')
       }
 
       ws.onmessage = (ev) => {
@@ -190,6 +218,9 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
                 createdAt: req.createdAt || Date.now(),
               })))
             }
+            setIsThinking(false)
+            setStatus(msg.active ? 'running' : 'idle')
+            setErrorMsg(null)
             break
 
           case 'chat_history':
@@ -291,24 +322,32 @@ export default function AgentChat({ agent, sessionId, accentColor = '#00FFA7', e
 
       ws.onerror = () => {
         if (cancelled) return
-        setStatus('error')
-        setErrorMsg('WebSocket error')
+        setStatus('connecting')
+        setErrorMsg(null)
       }
 
       ws.onclose = () => {
-        if (pingRef.current) { clearInterval(pingRef.current); pingRef.current = null }
+        clearPing()
+        if (!cancelled) {
+          wsRef.current = null
+          scheduleReconnect()
+        }
       }
 
+      clearPing()
       pingRef.current = setInterval(() => {
         if (ws!.readyState === WebSocket.OPEN) {
           ws!.send(JSON.stringify({ type: 'ping' }))
         }
       }, 25000)
-    })()
+    }
+
+    connectOnce()
 
     return () => {
       cancelled = true
-      if (pingRef.current) { clearInterval(pingRef.current); pingRef.current = null }
+      clearReconnect()
+      clearPing()
       try { ws?.close() } catch {}
       wsRef.current = null
     }
